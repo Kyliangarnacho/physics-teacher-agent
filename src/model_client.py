@@ -3,9 +3,7 @@
 from openai import APIConnectionError, APIError, AuthenticationError, OpenAI, RateLimitError
 
 from src.config import load_qwen_config
-
-
-SYSTEM_MESSAGE = "你是一名初中物理教师，请使用初中物理范围内的知识，正确、清晰、简洁地回答。"
+from src.prompts import JUNIOR_PHYSICS_SYSTEM_PROMPT
 
 
 def answer_question(question: str) -> str:
@@ -20,7 +18,7 @@ def answer_question(question: str) -> str:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "system", "content": JUNIOR_PHYSICS_SYSTEM_PROMPT},
                 {"role": "user", "content": question.strip()},
             ],
         )
