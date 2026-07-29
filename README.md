@@ -2,8 +2,9 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 03 的
-teacher_v1 基础提示词与工程回归，使用 `qwen3.7-flash` 回答初中物理问题。
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前进入 Stage 04 工程收尾，
+使用 `qwen3.7-flash` 回答初中物理问题，提示词版本冻结为
+`teacher_v3_personal_humor`。
 
 ## 环境与配置
 
@@ -22,19 +23,26 @@ teacher_v1 基础提示词与工程回归，使用 `qwen3.7-flash` 回答初中�
 - `src/config.py`：加载并校验 `.env` 中的千问配置
 - `src/prompts.py`：保存提示词版本和初中物理教师 system prompt
 - `src/model_client.py`：从提示词模块导入 system prompt，校验问题、调用千问并返回回答
-- `evaluation/stage03_prompt_cases.md`：记录 Stage 03 的 5 道固定行为测试题和评分维度
+- `evaluation/stage04_text_cases_v1.json`：保存 15 道 Stage 04 纯文本评测题
+- `evaluation/results/`：保存不同提示词版本的 JSONL 评测结果
+- `evaluation/reviews/`：保存人工评审表与版本对比
+- `evaluation/validate_stage04_text_cases.py`：校验题目字段、数量和 ID
+- `evaluation/run_stage04_text_evaluation.py`：支持 `--limit` 和断点续跑的评测入口
+- `tests/`：使用 Python 标准库 `unittest` 验证评测工具
 
-## Stage 03 提示词状态
+## Stage 04 提示词与评测状态
 
-当前提示词版本为 `teacher_v1`。它是用于建立评测流程的临时基础版本，不是最终的个人
-教学风格。
+当前提示词版本为 `teacher_v3_personal_humor`，本阶段已冻结，不再依据现有 5 道题继续
+调整。个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心；幽默只在语境自然匹配时
+偶尔出现，不要求每题都有。
 
-当前 5 道固定题主要验证简单计算、概念解释、提示请求、错误诊断和条件不足处理。修改后
-5 次调用均返回非空 content，但问题 4 仍会在定位错误后继续完整计算，问题 5 相比“只指出
-缺失信息”的目标仍略显冗长。
+已建立 15 道文本评测题。`teacher_v2_personal` 和
+`teacher_v3_personal_humor` 均只完成了前 5 道真实调用，尚未运行全部 15 道。
+S04-TXT-001 已由用户人工评分为 7/8，其余题目的人工评分仍待完成。
 
-本阶段没有使用有代表性的个人题库，因此这些结果不代表完整的初中物理能力，也不能证明
-`teacher_v1` 全面优于旧提示词。
+原始 PDF、Word 和私有风格示例仅保存在 Git 忽略的 `data/raw/` 与
+`data/private_evaluation/`，不会提交 Git。可提交的重写评测题和元数据位于
+`evaluation/`。
 
 ## 运行
 
@@ -51,6 +59,24 @@ teacher_v1 基础提示词与工程回归，使用 `qwen3.7-flash` 回答初中�
 ```
 
 启动后默认访问 `http://localhost:8501`。
+
+本地校验与单元测试：
+
+```powershell
+.venv\Scripts\python.exe evaluation\validate_stage04_text_cases.py
+.venv\Scripts\python.exe -m unittest discover -v
+```
+
+运行前 5 道真实评测时必须显式使用独立结果文件，以保留不同提示词版本：
+
+```powershell
+.venv\Scripts\python.exe evaluation\run_stage04_text_evaluation.py `
+  --limit 5 `
+  --output evaluation\results\stage04_text_v1_teacher_v3_personal_humor_results.jsonl
+```
+
+评测脚本会跳过结果文件中已存在的 ID。该命令会产生 API 调用；仅在需要新评测且已确认
+API 配置与费用时执行。
 
 ## 会话与请求行为
 
@@ -69,7 +95,9 @@ teacher_v1 基础提示词与工程回归，使用 `qwen3.7-flash` 回答初中�
 - 临时缺少 `QWEN_MODEL` 时给出清楚的中文错误，测试后恢复正常配置
 - Streamlit 服务启动并在 `http://localhost:8501` 返回 HTTP 200
 - `compileall`、`pip check` 和 `git diff --check` 通过
-- teacher_v1 的 5 道固定行为测试均返回非空 content
+- Stage 04 评测集为 15 题，字段完整且 ID 唯一
+- `teacher_v2_personal` 与 `teacher_v3_personal_humor` 的前 5 题结果均为非空
+  `content`
 
 用户手动验证的网页结果：
 
@@ -79,5 +107,5 @@ teacher_v1 基础提示词与工程回归，使用 `qwen3.7-flash` 回答初中�
 
 ## 当前限制
 
-模型每次仍只接收当前问题，没有多轮记忆。当前不支持图片、数据库、RAG、工具调用、
-MCP 或真正的多轮上下文，也未加入其他 Agent 框架或后续阶段功能。
+模型每次仍只接收当前问题，没有多轮记忆。当前未实现图片输入、数据库、RAG、工具调用、
+MCP、微调或真正的多轮上下文，也未加入其他 Agent 框架。

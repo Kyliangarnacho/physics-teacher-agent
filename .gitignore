@@ -4,3 +4,5 @@ __pycache__/
 **/__pycache__/
 *.pyc
 .vscode/
+data/raw/
+data/private_evaluation/
