@@ -49,6 +49,49 @@ class BuildMessagesTests(unittest.TestCase):
         )
         self.assertEqual(messages[2]["content"], "光屏应该放在哪里？")
 
+    def test_mode_instruction_is_inserted_between_teacher_and_user(self) -> None:
+        messages = build_messages(
+            "只给我第一步提示。",
+            mode_instruction="只给当前一步有效提示。",
+        )
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "system",
+                    "content": JUNIOR_PHYSICS_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "system",
+                    "content": "只给当前一步有效提示。",
+                },
+                {"role": "user", "content": "只给我第一步提示。"},
+            ],
+        )
+
+    def test_mode_instruction_precedes_context(self) -> None:
+        messages = build_messages(
+            "分析我的电路错误。",
+            context="欧姆定律的参考资料。",
+            mode_instruction="先定位第一处关键错误。",
+        )
+
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "system", "system", "user"],
+        )
+        self.assertEqual(
+            messages[0]["content"],
+            JUNIOR_PHYSICS_SYSTEM_PROMPT,
+        )
+        self.assertEqual(
+            messages[1]["content"],
+            "先定位第一处关键错误。",
+        )
+        self.assertIn("欧姆定律的参考资料。", messages[2]["content"])
+        self.assertEqual(messages[3]["content"], "分析我的电路错误。")
+
     def test_context_does_not_replace_or_modify_question(self) -> None:
         question = "并联支路电阻变化时，电流怎样变化？"
 
@@ -63,6 +106,19 @@ class BuildMessagesTests(unittest.TestCase):
         self.assertEqual(
             build_messages(question, None),
             build_messages(question, " \t\r\n "),
+        )
+
+    def test_none_or_blank_mode_instruction_is_not_inserted(self) -> None:
+        question = "什么是电功率？"
+        plain_messages = build_messages(question)
+
+        self.assertEqual(
+            build_messages(question, mode_instruction=None),
+            plain_messages,
+        )
+        self.assertEqual(
+            build_messages(question, mode_instruction=" \t\r\n "),
+            plain_messages,
         )
 
     def test_empty_question_is_rejected(self) -> None:
@@ -102,13 +158,63 @@ class AnswerQuestionContextTests(unittest.TestCase):
             ]
         )
 
-        answer = answer_question("原问题", context="参考资料")
+        answer = answer_question(
+            "原问题",
+            context="参考资料",
+            mode_instruction="解释核心概念。",
+        )
 
         self.assertEqual(answer, "测试回答")
-        mock_build_messages.assert_called_once_with("原问题", "参考资料")
+        mock_build_messages.assert_called_once_with(
+            "原问题",
+            "参考资料",
+            "解释核心概念。",
+        )
         mock_openai.assert_called_once_with(
             api_key="test-api-key",
             base_url="https://example.invalid/v1",
+        )
+        client.chat.completions.create.assert_called_once_with(
+            model="test-model",
+            messages=expected_messages,
+        )
+
+    @patch("src.model_client.OpenAI")
+    @patch("src.model_client.load_qwen_config")
+    @patch("src.model_client.build_messages")
+    def test_old_positional_context_call_remains_supported(
+        self,
+        mock_build_messages: Mock,
+        mock_load_qwen_config: Mock,
+        mock_openai: Mock,
+    ) -> None:
+        expected_messages = [
+            {"role": "system", "content": "基础提示词"},
+            {"role": "system", "content": "参考资料消息"},
+            {"role": "user", "content": "原问题"},
+        ]
+        mock_build_messages.return_value = expected_messages
+        mock_load_qwen_config.return_value = (
+            "test-api-key",
+            "https://example.invalid/v1",
+            "test-model",
+        )
+        client = mock_openai.return_value
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="兼容回答")
+                )
+            ]
+        )
+
+        answer = answer_question("原问题", "参考资料")
+
+        self.assertEqual(answer, "兼容回答")
+        mock_build_messages.assert_called_once_with(
+            "原问题",
+            "参考资料",
+            None,
         )
         client.chat.completions.create.assert_called_once_with(
             model="test-model",

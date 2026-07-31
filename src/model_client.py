@@ -17,14 +17,22 @@ REFERENCE_CONTEXT_TEMPLATE = """以下内容是回答问题时可参考的物理
 def build_messages(
     question: str,
     context: str | None = None,
+    mode_instruction: str | None = None,
 ) -> list[dict[str, str]]:
-    """构造普通问答或带参考资料的消息列表。"""
+    """构造普通问答或带模式指令、参考资料的消息列表。"""
     if not question or not question.strip():
         raise ValueError("问题不能为空，请提供一道初中物理问题。")
 
     messages = [
         {"role": "system", "content": JUNIOR_PHYSICS_SYSTEM_PROMPT},
     ]
+    if mode_instruction is not None and mode_instruction.strip():
+        messages.append(
+            {
+                "role": "system",
+                "content": mode_instruction.strip(),
+            }
+        )
     if context is not None and context.strip():
         messages.append(
             {
@@ -38,9 +46,13 @@ def build_messages(
     return messages
 
 
-def answer_question(question: str, context: str | None = None) -> str:
+def answer_question(
+    question: str,
+    context: str | None = None,
+    mode_instruction: str | None = None,
+) -> str:
     """调用千问回答一道初中物理问题。"""
-    messages = build_messages(question, context)
+    messages = build_messages(question, context, mode_instruction)
     api_key, base_url, model = load_qwen_config()
     client = OpenAI(api_key=api_key, base_url=base_url)
 

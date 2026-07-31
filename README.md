@@ -2,9 +2,10 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已实现 Stage 05 最小
-RAG：可以选择使用本地初中物理知识卡片，通过 BM25 检索相关资料后再调用
-`qwen3.7-flash`。提示词版本仍冻结为 `teacher_v3_personal_humor`。
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 06：在
+Stage 05 本地 BM25 RAG 基础上，加入结构化问题分析、教学模式路由、统一 Agent 编排
+和网页决策展示。当前模型为 `qwen3.7-flash`，提示词版本仍为
+`teacher_v3_personal_humor`。
 
 ## 环境与配置
 
@@ -18,12 +19,16 @@ RAG：可以选择使用本地初中物理知识卡片，通过 BM25 检索相�
 
 ## 代码职责
 
-- `app.py`：提供 Streamlit 聊天页面，在普通问答和本地知识库 RAG 之间切换，并保存
-  当前页面的消息与来源
+- `app.py`：提供 Streamlit 聊天页面，调用统一 Agent，并保存当前会话的回答、分析、
+  路由和来源
 - `main.py`：运行固定平均速度题，作为终端回归入口
 - `src/config.py`：加载并校验 `.env` 中的千问配置
-- `src/prompts.py`：保存提示词版本和初中物理教师 system prompt
-- `src/model_client.py`：构造普通消息或带参考资料的消息，调用千问并返回回答
+- `src/schemas.py`：定义 `TeachingMode`、`QuestionAnalysis` 和 `RouteDecision`
+- `src/analyzer.py`：调用千问分析问题并校验结构化 JSON，失败时返回安全 fallback
+- `src/router.py`：处理教学模式覆盖、RAG 三态和缺图安全拦截
+- `src/agent.py`：统一编排 Analyzer、Router、可选 RAG 和最终回答
+- `src/prompts.py`：保存教师 Prompt、Analyzer Prompt 和四种模式指令
+- `src/model_client.py`：按顺序注入模式指令和可选参考资料，调用千问并返回回答
 - `knowledge/physics_notes_v1.jsonl`：保存 10 条可检索的初中物理知识卡片
 - `src/retriever.py`：使用 `jieba` 分词和 `BM25Okapi` 排序，过滤低相关结果
 - `src/rag.py`：编排知识检索、context 构造、模型调用和精简来源返回
@@ -33,7 +38,38 @@ RAG：可以选择使用本地初中物理知识卡片，通过 BM25 检索相�
 - `evaluation/reviews/`：保存人工评审表与版本对比
 - `evaluation/validate_stage04_text_cases.py`：校验题目字段、数量和 ID
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit` 和断点续跑的评测入口
-- `tests/`：使用 Python 标准库 `unittest` 验证评测、检索、RAG 和消息构造
+- `tests/`：使用 Python 标准库 `unittest` 验证 Schema、Analyzer、Router、Agent、
+  检索、RAG、消息构造和事实守护
+
+## Stage 06 Agent 路由
+
+Stage 06 已实现：
+
+- Pydantic v2 Schema 和严格字段校验
+- Question Analyzer 与安全 fallback
+- `solve`、`explain`、`hint`、`diagnose` 四种教学模式
+- Router 与 `auto`、`force`、`off` 三态 RAG 策略
+- 缺图时停止检索和回答，提示用户补充题图或完整描述
+- 模式指令及 RAG 参考资料的独立 system 消息注入
+- 统一入口 `run_teacher_agent()`
+- Streamlit 页面中的 Agent 决策和知识来源折叠展示
+
+当前完整数据流：
+
+```text
+用户问题
+→ Analyzer 第一次模型调用
+→ QuestionAnalysis 校验
+→ Router
+→ RouteDecision
+→ 可选 BM25 RAG
+→ 模式指令和可选参考资料
+→ 第二次模型调用
+→ 页面展示答案、Agent 决策和来源
+```
+
+Analyzer 返回非法 JSON、字段不合法或调用异常时不重试，而是使用安全的 `solve`
+分析继续处理，并在最终结果中标记 `analysis_fallback=true`。
 
 ## Stage 05 最小 RAG
 
@@ -90,12 +126,15 @@ S04-TXT-001 已由用户人工评分为 7/8，其余题目的人工评分仍待�
 
 启动后默认访问 `http://localhost:8501`。
 
-页面中的“使用本地物理知识库”复选框默认不勾选：
+页面侧边栏提供两组选择，默认均为自动：
 
-- 不勾选：保持原有普通问答。
-- 勾选：每次使用本地 BM25 检索，最多选取 3 条达到相对阈值的资料。
+- 教学模式：自动判断、完整解题、概念讲解、只给提示、错误诊断。
+- 知识库策略：自动决定、强制使用、不使用。
+- 自动决定或强制使用 RAG 时，最多选取 3 条达到相对阈值的资料。
 - 有来源：在回答下方的折叠区域显示知识卡片 ID、主题和原始文件名。
 - 无来源：提示本次按普通问答处理。
+- 每条新回答还保存并显示最终教学模式、物理主题、问题类型、RAG 决策、简短理由和
+  Analyzer fallback 状态。
 
 本地校验与单元测试：
 
@@ -120,9 +159,12 @@ API 配置与费用时执行。
 
 ## 会话与请求行为
 
-网页使用 `st.session_state` 保存当前页面的用户消息和教师回答。RAG 消息还保存
-`rag_enabled` 和精简的 `sources`，因此页面重新运行时仍能显示当次来源。历史仅属于
-当前浏览器会话/标签页，关闭页面或重启服务后不会持久保存。
+网页使用 `st.session_state` 保存当前页面的用户消息和教师回答。新 Assistant 消息保存
+`content`、`sources`、`analysis`、`route` 和 `analysis_fallback`，因此同一会话内
+脚本重新运行时仍能显示当次决策与来源。旧消息缺少这些字段时也能安全显示。
+
+历史仅属于当前浏览器会话/标签页。浏览器新会话、硬刷新导致会话重建或服务重启后，
+历史不会持久保存。
 
 页面可以显示多轮聊天记录，但每次调用模型时只发送当前问题，不发送页面中的完整历史，
 因此目前不是真正的多轮上下文对话。RAG context 也只来自当前问题的本次检索。
@@ -141,12 +183,16 @@ API 配置与费用时执行。
   `content`
 - Stage 05 知识库 10 条卡片通过结构与唯一性校验
 - 检索、RAG 编排和 context 消息均由 fake/mock 测试覆盖，不调用千问
-- 当前全部单元测试为 29 项，全部通过
+- 当前全部单元测试为 83 项，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，页面与终端没有出现应用 traceback
 - 已真实验证电热器和凸透镜 RAG 问答；加入相对分数过滤后再次验证电热器问题，网页来源
   只返回 `KB-POWER-001`
 - 概念验收已确认核心 RAG 数据流；Mock 测试边界和 BM25 分数含义仍需继续复习，但不阻塞
   当前工程验收
+- Stage 06 已完成真实 `diagnose` 和 `explain` Agent 场景；自动 Agent 问答通常包含
+  Analyzer 和最终回答两次模型调用
+- 教师 Prompt 已加入绝对化前提检查、先勘误再回答和条件变化事实守护；`KB-ELEC-003`
+  已补充额定功率定义、相等条件和白炽灯丝电阻随温度变化的边界
 
 用户手动验证的网页结果：
 
@@ -160,5 +206,10 @@ API 配置与费用时执行。
 匹配，没有向量检索、重排序、系统化召回评测或自动事实校验。当前真实网页验收只覆盖普通
 问答、电热器和凸透镜等少量问题，不能代表完整 RAG 效果。
 
-模型每次仍只接收当前问题，没有多轮记忆。当前未实现图片输入、OCR、数据库、工具调用、
-MCP、微调或真正的多轮上下文，也未加入其他 Agent 框架。
+自动模式通常需要 Analyzer 和最终回答两次模型请求，会增加延迟和 API 费用。Analyzer
+仍可能发生语义分类错误；Schema 和 Router 只能校验结构与流程，不能验证最终回答的物理
+事实，模型仍可能遗漏预期细节。
+
+模型每次仍只接收当前问题，没有真正的多轮上下文记忆；页面显示历史不等于模型记忆。
+当前不支持图片上传或图片理解，`image_required` 只是缺图安全拦截。知识库仍只有 10 条
+文本卡片，BM25 覆盖有限。当前也未实现 OCR、数据库、工具调用、MCP 或微调。
