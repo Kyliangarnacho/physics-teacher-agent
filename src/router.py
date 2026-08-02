@@ -30,6 +30,7 @@ def route_question(
         return RouteDecision(
             teaching_mode=teaching_mode,
             use_rag=False,
+            use_tools=False,
             should_answer=False,
             user_message="请补充题图，或完整描述图中的物体、连接关系和已知信息。",
         )
@@ -38,9 +39,11 @@ def route_question(
         use_rag = analysis.needs_rag
     else:
         use_rag = rag_policy == "force"
+    use_tools = analysis.calculation_required and not analysis.missing_conditions
 
     return RouteDecision(
         teaching_mode=teaching_mode,
         use_rag=use_rag,
+        use_tools=use_tools,
         should_answer=True,
     )

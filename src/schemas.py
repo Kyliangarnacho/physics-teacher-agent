@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints
 
 
 NonEmptyText = Annotated[
@@ -38,6 +38,7 @@ class QuestionAnalysis(BaseModel):
     image_required: bool
     student_work_provided: bool
     short_reason: ShortReasonText
+    calculation_required: StrictBool = False
 
 
 class RouteDecision(BaseModel):
@@ -49,3 +50,4 @@ class RouteDecision(BaseModel):
     use_rag: bool
     should_answer: bool
     user_message: str | None = None
+    use_tools: StrictBool = False

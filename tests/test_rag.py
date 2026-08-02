@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock
 
-from src.rag import answer_with_rag, build_context
+from src.rag import answer_with_rag, build_context, retrieve_rag_context
 
 
 CARDS = [
@@ -53,6 +53,56 @@ class BuildContextTests(unittest.TestCase):
             self.assertIn(card["topic"], context)
             self.assertIn(card["source"], context)
             self.assertIn(card["content"], context)
+
+
+class RetrieveRagContextTests(unittest.TestCase):
+    def test_returns_context_and_reduced_sources(self) -> None:
+        result = retrieve_rag_context(
+            "并联电路怎样变化？",
+            retriever=FakeRetriever(CARDS),
+        )
+
+        self.assertEqual(result["context"], build_context(CARDS))
+        self.assertEqual(set(result), {"context", "sources"})
+        for source in result["sources"]:
+            self.assertEqual(set(source), {"id", "topic", "source", "score"})
+            self.assertNotIn("content", source)
+
+    def test_sources_keep_retrieval_order(self) -> None:
+        result = retrieve_rag_context(
+            "测试问题",
+            retriever=FakeRetriever(CARDS),
+        )
+
+        self.assertEqual(
+            [source["id"] for source in result["sources"]],
+            ["KB-ELEC-002", "KB-ELEC-001"],
+        )
+
+    def test_top_k_is_forwarded_to_retriever(self) -> None:
+        retriever = FakeRetriever(CARDS)
+
+        retrieve_rag_context("测试问题", top_k=2, retriever=retriever)
+
+        self.assertEqual(retriever.calls, [("测试问题", 2)])
+
+    def test_no_results_returns_none_context_and_empty_sources(self) -> None:
+        result = retrieve_rag_context(
+            "无相关资料的问题",
+            retriever=FakeRetriever([]),
+        )
+
+        self.assertEqual(result, {"context": None, "sources": []})
+
+    def test_empty_question_is_rejected_before_retriever(self) -> None:
+        retriever = Mock()
+
+        for question in ("", " ", "\t\r\n"):
+            with self.subTest(question=repr(question)):
+                with self.assertRaisesRegex(ValueError, "问题不能为空"):
+                    retrieve_rag_context(question, retriever=retriever)
+
+        retriever.search.assert_not_called()
 
 
 class AnswerWithRagTests(unittest.TestCase):
@@ -127,6 +177,17 @@ class AnswerWithRagTests(unittest.TestCase):
         )
 
         self.assertEqual(retriever.calls, [("测试问题", 2)])
+
+    def test_retrieval_is_executed_only_once(self) -> None:
+        retriever = FakeRetriever(CARDS)
+
+        answer_with_rag(
+            "测试问题",
+            retriever=retriever,
+            answer_func=Mock(return_value="测试回答"),
+        )
+
+        self.assertEqual(retriever.calls, [("测试问题", 3)])
 
     def test_empty_question_is_rejected_before_dependencies_are_used(self) -> None:
         retriever = Mock()

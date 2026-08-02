@@ -56,6 +56,21 @@ class QuestionAnalysisTests(unittest.TestCase):
 
                 self.assertEqual(analysis.teaching_mode, mode)
 
+    def test_calculation_required_accepts_explicit_booleans(self) -> None:
+        for value in (True, False):
+            with self.subTest(value=value):
+                data = valid_analysis_data()
+                data["calculation_required"] = value
+
+                analysis = QuestionAnalysis(**data)
+
+                self.assertIs(analysis.calculation_required, value)
+
+    def test_calculation_required_defaults_to_false(self) -> None:
+        analysis = QuestionAnalysis(**valid_analysis_data())
+
+        self.assertFalse(analysis.calculation_required)
+
     def test_rejects_invalid_teaching_mode(self) -> None:
         data = valid_analysis_data()
         data["teaching_mode"] = "chat"
@@ -119,6 +134,54 @@ class RouteDecisionTests(unittest.TestCase):
 
         self.assertEqual(decision.teaching_mode, TeachingMode.HINT)
         self.assertEqual(decision.user_message, "请补充题目图片。")
+
+    def test_use_tools_accepts_explicit_booleans(self) -> None:
+        for value in (True, False):
+            with self.subTest(value=value):
+                decision = RouteDecision(
+                    teaching_mode="solve",
+                    use_rag=False,
+                    should_answer=True,
+                    use_tools=value,
+                )
+
+                self.assertIs(decision.use_tools, value)
+
+    def test_use_tools_defaults_to_false(self) -> None:
+        decision = RouteDecision(
+            teaching_mode="solve",
+            use_rag=False,
+            should_answer=True,
+        )
+
+        self.assertFalse(decision.use_tools)
+
+    def test_model_dump_contains_new_defaulted_fields(self) -> None:
+        analysis_dump = QuestionAnalysis(**valid_analysis_data()).model_dump()
+        decision_dump = RouteDecision(
+            teaching_mode="solve",
+            use_rag=False,
+            should_answer=True,
+        ).model_dump()
+
+        self.assertIn("calculation_required", analysis_dump)
+        self.assertFalse(analysis_dump["calculation_required"])
+        self.assertIn("use_tools", decision_dump)
+        self.assertFalse(decision_dump["use_tools"])
+
+    def test_new_fields_reject_non_boolean_types(self) -> None:
+        analysis_data = valid_analysis_data()
+        analysis_data["calculation_required"] = "true"
+        with self.assertRaises(ValidationError):
+            QuestionAnalysis(**analysis_data)
+
+        with self.assertRaises(ValidationError):
+            RouteDecision(
+                teaching_mode="solve",
+                use_rag=False,
+                should_answer=True,
+                use_tools=1,
+            )
 
     def test_rejects_extra_field(self) -> None:
         with self.assertRaises(ValidationError):

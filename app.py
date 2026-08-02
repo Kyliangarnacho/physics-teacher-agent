@@ -248,6 +248,10 @@ def render_agent_decision(message: dict[str, object]) -> None:
         teaching_mode or "未知",
     )
     use_rag = "是" if route.get("use_rag", False) else "否"
+    calculation_required = (
+        "是" if analysis.get("calculation_required", False) else "否"
+    )
+    use_tools = "是" if route.get("use_tools", False) else "否"
     fallback = "是" if message.get("analysis_fallback", False) else "否"
 
     with st.expander(
@@ -260,9 +264,90 @@ def render_agent_decision(message: dict[str, object]) -> None:
             f"**物理主题：** {analysis.get('physics_topic', '未知')}  \n"
             f"**问题类型：** {analysis.get('question_type', '未知')}  \n"
             f"**是否使用知识库：** {use_rag}  \n"
+            f"**Analyzer 判断需要计算：** {calculation_required}  \n"
+            f"**Router 启用本地工具：** {use_tools}  \n"
             f"**简短判断理由：** {analysis.get('short_reason', '无')}  \n"
             f"**Analyzer 是否发生 fallback：** {fallback}"
         )
+
+
+def _tool_record_to_dict(record: object) -> dict[str, object] | None:
+    """将字典或 Pydantic 工具记录转为统一的可展示字典。"""
+    if isinstance(record, dict):
+        return record
+
+    model_dump = getattr(record, "model_dump", None)
+    if not callable(model_dump):
+        return None
+
+    dumped = model_dump(mode="json")
+    return dumped if isinstance(dumped, dict) else None
+
+
+def render_tool_records(message: dict[str, object]) -> None:
+    """渲染非空的本地计算工具执行记录。"""
+    records = message.get("tool_records")
+    if not isinstance(records, list) or not records:
+        return
+
+    display_records = [
+        record_data
+        for record in records
+        if (record_data := _tool_record_to_dict(record)) is not None
+    ]
+    if not display_records:
+        return
+
+    with st.expander(
+        "本地计算工具记录",
+        expanded=False,
+        icon=":material/calculate:",
+    ):
+        st.caption(
+            "Tool Client 内部模型请求数："
+            f"{message.get('tool_model_requests', 0)}"
+        )
+        for index, record in enumerate(display_records, start=1):
+            if index > 1:
+                st.divider()
+
+            status = record.get("status", "")
+            status_text = getattr(status, "value", status)
+            st.markdown(
+                f"**记录 {index}**  \n"
+                f"**name：** `{record.get('name', '')}`  \n"
+                f"**status：** `{status_text}`"
+            )
+
+            st.markdown("**arguments：**")
+            arguments = record.get("arguments", {})
+            st.json(arguments if isinstance(arguments, dict) else {})
+
+            normalized_fields = record.get("normalized_fields", [])
+            if isinstance(normalized_fields, list) and normalized_fields:
+                normalized_text = ", ".join(
+                    str(field) for field in normalized_fields
+                )
+            else:
+                normalized_text = "无"
+            st.markdown(f"**normalized_fields：** {normalized_text}")
+
+            result = record.get("result")
+            if isinstance(result, dict):
+                display_value = result.get("display_value", "")
+                unit = result.get("unit", "")
+                st.markdown(
+                    f"**formula：** `{result.get('formula', '')}`  \n"
+                    f"**result：** `{display_value} {unit}`"
+                )
+            else:
+                st.markdown("**result：** 无")
+
+            error = record.get("error")
+            if error:
+                st.error(str(error))
+            else:
+                st.markdown("**error：** 无")
 
 
 def render_chat_message(message: dict[str, object], message_index: int) -> None:
@@ -279,6 +364,7 @@ def render_chat_message(message: dict[str, object], message_index: int) -> None:
             if not is_user:
                 render_rag_sources(message)
                 render_agent_decision(message)
+                render_tool_records(message)
 
 
 st.set_page_config(
@@ -314,7 +400,10 @@ if queued_question is not None:
 
 with st.sidebar:
     st.markdown("**初中物理教师**")
-    st.caption("面向初中物理学习的个人教师 Agent，支持普通问答与本地知识库辅助。")
+    st.caption(
+        "面向初中物理学习的个人教师 Agent，支持普通问答、"
+        "本地知识库辅助与本地确定性计算工具。"
+    )
     st.button(
         "清空当前对话",
         key="clear_conversation",
@@ -419,6 +508,11 @@ if not is_empty_state and response_slot is not None:
                     "analysis_fallback": agent_result.get(
                         "analysis_fallback",
                         False,
+                    ),
+                    "tool_records": agent_result.get("tool_records", []),
+                    "tool_model_requests": agent_result.get(
+                        "tool_model_requests",
+                        0,
                     ),
                 }
                 st.session_state.messages.append(assistant_message)

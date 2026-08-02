@@ -8,8 +8,9 @@ from typing import Any
 from src.analyzer import analyze_question
 from src.model_client import answer_question
 from src.prompts import MODE_INSTRUCTIONS
-from src.rag import answer_with_rag
+from src.rag import retrieve_rag_context
 from src.router import route_question
+from src.tool_client import answer_with_tools
 
 
 def run_teacher_agent(
@@ -19,6 +20,7 @@ def run_teacher_agent(
     analyzer_func: Callable[[str], str] | None = None,
     retriever: Any = None,
     answer_func: Callable[..., str] | None = None,
+    tool_answer_func: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """分析、路由并回答一道初中物理问题。"""
     if not isinstance(question, str) or not question.strip():
@@ -42,6 +44,8 @@ def run_teacher_agent(
             "route": route.model_dump(mode="json"),
             "sources": [],
             "analysis_fallback": analysis_fallback,
+            "tool_records": [],
+            "tool_model_requests": 0,
         }
 
     mode_instruction = MODE_INSTRUCTIONS[route.teaching_mode.value]
@@ -49,32 +53,37 @@ def run_teacher_agent(
         answer_func if answer_func is not None else answer_question
     )
 
+    context = None
+    sources: list[dict[str, Any]] = []
     if route.use_rag:
-        def answer_with_mode(
-            rag_question: str,
-            context: str | None = None,
-        ) -> str:
-            return active_answer_func(
-                rag_question,
-                context=context,
-                mode_instruction=mode_instruction,
-            )
-
-        rag_result = answer_with_rag(
+        retrieval = retrieve_rag_context(
             normalized_question,
             top_k=3,
             retriever=retriever,
-            answer_func=answer_with_mode,
         )
-        answer = rag_result["answer"]
-        sources = rag_result["sources"]
+        context = retrieval["context"]
+        sources = retrieval["sources"]
+
+    if route.use_tools:
+        active_tool_answer_func = (
+            tool_answer_func if tool_answer_func is not None else answer_with_tools
+        )
+        tool_result = active_tool_answer_func(
+            normalized_question,
+            context=context,
+            mode_instruction=mode_instruction,
+        )
+        answer = tool_result["answer"]
+        tool_records = tool_result["tool_records"]
+        tool_model_requests = tool_result["model_requests"]
     else:
         answer = active_answer_func(
             normalized_question,
-            context=None,
+            context=context,
             mode_instruction=mode_instruction,
         )
-        sources = []
+        tool_records = []
+        tool_model_requests = 0
 
     return {
         "answer": answer,
@@ -82,4 +91,6 @@ def run_teacher_agent(
         "route": route.model_dump(mode="json"),
         "sources": sources,
         "analysis_fallback": analysis_fallback,
+        "tool_records": tool_records,
+        "tool_model_requests": tool_model_requests,
     }

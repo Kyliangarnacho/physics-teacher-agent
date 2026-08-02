@@ -23,6 +23,7 @@ def _safe_default_analysis() -> QuestionAnalysis:
         image_required=False,
         student_work_provided=False,
         short_reason="问题分析失败，按普通完整解题处理。",
+        calculation_required=False,
     )
 
 

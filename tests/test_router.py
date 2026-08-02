@@ -18,6 +18,7 @@ def make_analysis(**overrides: object) -> QuestionAnalysis:
         "image_required": False,
         "student_work_provided": False,
         "short_reason": "需要解释电路中的物理关系。",
+        "calculation_required": False,
     }
     data.update(overrides)
     return QuestionAnalysis(**data)
@@ -66,9 +67,12 @@ class RouteQuestionTests(unittest.TestCase):
         self.assertFalse(decision.use_rag)
 
     def test_image_required_prevents_answer(self) -> None:
-        decision = route_question(make_analysis(image_required=True))
+        decision = route_question(
+            make_analysis(image_required=True, calculation_required=True)
+        )
 
         self.assertFalse(decision.should_answer)
+        self.assertFalse(decision.use_tools)
 
     def test_image_required_disables_rag_even_when_forced(self) -> None:
         decision = route_question(
@@ -90,6 +94,84 @@ class RouteQuestionTests(unittest.TestCase):
 
         self.assertTrue(decision.should_answer)
         self.assertIsNone(decision.user_message)
+
+    def test_no_calculation_requirement_disables_tools(self) -> None:
+        decision = route_question(make_analysis(calculation_required=False))
+
+        self.assertFalse(decision.use_tools)
+
+    def test_complete_calculation_requirement_enables_tools(self) -> None:
+        decision = route_question(
+            make_analysis(
+                calculation_required=True,
+                missing_conditions=False,
+            )
+        )
+
+        self.assertTrue(decision.use_tools)
+
+    def test_missing_conditions_disable_tools_but_still_allow_answer(self) -> None:
+        decision = route_question(
+            make_analysis(
+                calculation_required=True,
+                missing_conditions=True,
+            )
+        )
+
+        self.assertFalse(decision.use_tools)
+        self.assertTrue(decision.should_answer)
+
+    def test_rag_and_tools_can_both_be_enabled(self) -> None:
+        decision = route_question(
+            make_analysis(
+                needs_rag=True,
+                calculation_required=True,
+            )
+        )
+
+        self.assertTrue(decision.use_rag)
+        self.assertTrue(decision.use_tools)
+
+    def test_rag_off_does_not_disable_tools(self) -> None:
+        decision = route_question(
+            make_analysis(calculation_required=True),
+            rag_policy="off",
+        )
+
+        self.assertFalse(decision.use_rag)
+        self.assertTrue(decision.use_tools)
+
+    def test_forced_rag_does_not_force_tools(self) -> None:
+        decision = route_question(
+            make_analysis(
+                needs_rag=False,
+                calculation_required=False,
+            ),
+            rag_policy="force",
+        )
+
+        self.assertTrue(decision.use_rag)
+        self.assertFalse(decision.use_tools)
+
+    def test_hint_and_diagnose_can_still_use_tools(self) -> None:
+        for mode in ("hint", "diagnose"):
+            with self.subTest(mode=mode):
+                decision = route_question(
+                    make_analysis(
+                        teaching_mode=mode,
+                        calculation_required=True,
+                        missing_conditions=False,
+                    )
+                )
+
+                self.assertEqual(decision.teaching_mode.value, mode)
+                self.assertTrue(decision.use_tools)
+
+    def test_model_dump_contains_use_tools(self) -> None:
+        decision = route_question(make_analysis(calculation_required=True))
+
+        self.assertIn("use_tools", decision.model_dump(mode="json"))
+        self.assertTrue(decision.model_dump(mode="json")["use_tools"])
 
     def test_auto_preserves_hint_mode(self) -> None:
         decision = route_question(make_analysis(teaching_mode="hint"))

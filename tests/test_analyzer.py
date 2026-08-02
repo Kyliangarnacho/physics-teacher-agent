@@ -6,7 +6,10 @@ from src.prompts import MODE_INSTRUCTIONS, QUESTION_ANALYZER_SYSTEM_PROMPT
 from src.schemas import TeachingMode
 
 
-def valid_payload(mode: str = "solve") -> dict:
+def valid_payload(
+    mode: str = "solve",
+    calculation_required: bool = True,
+) -> dict:
     return {
         "teaching_mode": mode,
         "physics_topic": "力学",
@@ -16,6 +19,7 @@ def valid_payload(mode: str = "solve") -> dict:
         "image_required": False,
         "student_work_provided": False,
         "short_reason": "这是一道条件完整的力学计算题。",
+        "calculation_required": calculation_required,
     }
 
 
@@ -42,6 +46,23 @@ class TestAnalyzeQuestion(unittest.TestCase):
             QUESTION_ANALYZER_SYSTEM_PROMPT,
         )
 
+    def test_analyzer_prompt_defines_calculation_required_rules_and_examples(self):
+        self.assertIn("calculation_required：布尔值", QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn(
+            "calculation_required 与 needs_rag 相互独立",
+            QUESTION_ANALYZER_SYSTEM_PROMPT,
+        )
+        self.assertIn(
+            "小车 10 秒行驶 50 米，求平均速度",
+            QUESTION_ANALYZER_SYSTEM_PROMPT,
+        )
+        self.assertIn("calculation_required=true", QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn(
+            "电阻为 6 Ω 时，为什么电阻会阻碍电流",
+            QUESTION_ANALYZER_SYSTEM_PROMPT,
+        )
+        self.assertIn("calculation_required=false", QUESTION_ANALYZER_SYSTEM_PROMPT)
+
     def test_valid_json_returns_question_analysis(self):
         analysis, fallback = analyze_question(
             "一辆小车的平均速度是多少？",
@@ -51,6 +72,42 @@ class TestAnalyzeQuestion(unittest.TestCase):
         self.assertEqual(analysis.teaching_mode, TeachingMode.SOLVE)
         self.assertEqual(analysis.physics_topic, "力学")
         self.assertTrue(analysis.needs_rag)
+        self.assertTrue(analysis.calculation_required)
+        self.assertFalse(fallback)
+
+    def test_calculation_required_true_and_false_are_parsed(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                analysis, fallback = analyze_question(
+                    "测试问题",
+                    lambda question, required=value: json_result(
+                        valid_payload(calculation_required=required)
+                    ),
+                )
+
+                self.assertIs(analysis.calculation_required, value)
+                self.assertIs(fallback, False)
+
+    def test_model_dump_contains_calculation_required(self):
+        analysis, fallback = analyze_question(
+            "求平均速度",
+            lambda question: json_result(valid_payload(calculation_required=True)),
+        )
+
+        self.assertIn("calculation_required", analysis.model_dump(mode="json"))
+        self.assertTrue(analysis.model_dump(mode="json")["calculation_required"])
+        self.assertFalse(fallback)
+
+    def test_missing_calculation_required_uses_schema_default_without_fallback(self):
+        payload = valid_payload()
+        del payload["calculation_required"]
+
+        analysis, fallback = analyze_question(
+            "旧格式测试问题",
+            lambda question: json_result(payload),
+        )
+
+        self.assertFalse(analysis.calculation_required)
         self.assertFalse(fallback)
 
     def test_all_four_teaching_modes_are_supported(self):
@@ -137,6 +194,7 @@ class TestAnalyzeQuestion(unittest.TestCase):
                 "image_required": False,
                 "student_work_provided": False,
                 "short_reason": "问题分析失败，按普通完整解题处理。",
+                "calculation_required": False,
             },
         )
         self.assertTrue(fallback)
