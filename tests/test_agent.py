@@ -430,6 +430,7 @@ class RunTeacherAgentTests(unittest.TestCase):
                 "analysis_fallback",
                 "tool_records",
                 "tool_model_requests",
+                "trace",
             },
         )
         self.assertIsInstance(result["analysis"], dict)
@@ -438,6 +439,7 @@ class RunTeacherAgentTests(unittest.TestCase):
         self.assertIsInstance(result["analysis_fallback"], bool)
         self.assertIsInstance(result["tool_records"], list)
         self.assertIsInstance(result["tool_model_requests"], int)
+        self.assertIsInstance(result["trace"], dict)
 
 
 if __name__ == "__main__":

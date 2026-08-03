@@ -1,37 +1,49 @@
 # 当前状态
 
-## Stage 06 状态
+## Stage 08 状态
 
 “初中物理教师 Agent + 阿里云百炼千问 API”当前使用 `qwen3.7-flash`，提示词版本仍为
-`teacher_v3_personal_humor`。Stage 06 已在 Stage 05 最小本地 RAG 上增加结构化
-Question Analyzer、Router、四种教学模式、三态 RAG 策略、统一 Agent 编排和网页决策
-展示。
+`teacher_v3_personal_humor`。Stage 08 已在 Stage 07 的五个本地计算工具、白名单 Tool
+Registry、Qwen Function Calling 与四条统一 Agent 路径基础上，加入结构化 Trace、一次有限
+Retry、8 题评测 Runner、结果汇总和网页运行轨迹展示。
 
 当前个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心。幽默仅在语境自然匹配时
 偶尔出现，不要求每题都有。
 
 ## 当前结构
 
-- `app.py`：Streamlit 页面入口，统一调用 Agent，保存并重渲染回答、决策和来源
+- `app.py`：Streamlit 页面入口，统一调用 Agent，保存并重渲染回答、决策、来源和工具记录
 - `main.py`：固定平均速度题的终端回归入口
 - `src/config.py`：使用 `python-dotenv` 加载并校验千问配置
-- `src/schemas.py`：定义 `TeachingMode`、`QuestionAnalysis` 和 `RouteDecision`
-- `src/analyzer.py`：执行第一次模型调用、解析并校验问题分析，失败时安全 fallback
-- `src/router.py`：处理模式覆盖、RAG 策略、缺图拦截和回答许可
-- `src/agent.py`：统一编排分析、路由、可选 RAG 与最终回答
+- `src/schemas.py`：定义教学模式、带计算需求的分析结果和带工具决策的路由结果
+- `src/analyzer.py`：执行问题分析；API 调用异常可有限重试，解析或 Schema 失败时安全 fallback
+- `src/router.py`：处理模式覆盖、RAG 策略、工具启用、缺图拦截和回答许可
+- `src/agent.py`：统一编排分析、路由、可选 RAG、可选 Tool Client、最终回答和运行 Trace
 - `src/prompts.py`：定义教师 Prompt、Analyzer Prompt 和 `MODE_INSTRUCTIONS`
 - `src/model_client.py`：注入模式指令和可选参考资料，并调用最终回答模型
 - `knowledge/physics_notes_v1.jsonl`：10 条初中物理知识卡片
 - `src/retriever.py`：使用 `jieba` 和 `rank_bm25.BM25Okapi` 建立本地文本索引
-- `src/rag.py`：把检索结果整理为 context，调用模型并返回回答与精简 sources
+- `src/rag.py`：提供纯检索 context/sources 接口，并保留原 RAG 回答入口
+- `src/tools/physics_calculators.py`：五个基于 `Decimal` 的确定性本地计算函数
+- `src/tools/schemas.py`：五类严格 Pydantic v2 工具参数合同
+- `src/tools/registry.py`：五工具白名单、数值字符串规范化、参数校验和结构化执行记录
+- `src/tool_client.py`：单工具两轮 Function Calling，并记录选择、执行、结果回答三个步骤；
+  API 调用可有限重试且不会重复执行成功的本地工具
+- `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并定义统一安全错误类别
+- `src/retry.py`：提供至多重试一次的通用有限 Retry
+- `scripts/probe_stage07_function_calling.py`：底层 Function Calling 人工诊断探针
+- `scripts/probe_stage07_agent_e2e.py`：统一 Agent 真实端到端验收探针
 - `scripts/validate_knowledge_base.py`：校验知识库 JSONL、字段、类型和 ID 唯一性
 - `evaluation/stage04_text_cases_v1.json`：15 道纯文本评测题
-- `evaluation/results/`：v2 与 v3 的前 5 题 JSONL 结果
+- `evaluation/results/`：保存 Stage 04 结果及 Stage 08 真实 JSONL 与 Markdown 汇总
+- `evaluation/stage08_agent_cases_v1.json`：8 道代表性 Agent 路径题
+- `evaluation/run_stage08_agent_evaluation.py`：支持 fake/real、筛选和断点续跑的评测入口
+- `evaluation/summarize_stage08_results.py`：汇总路由、请求、Retry、RAG、工具和错误统计
 - `evaluation/reviews/`：人工评审表和新旧版本对比
 - `evaluation/validate_stage04_text_cases.py`：评测数据校验入口
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit`、独立输出文件和断点续跑
-- `tests/`：基于标准库 `unittest` 的 Schema、Analyzer、Router、Agent、评测、检索、
-  RAG、消息和事实守护测试
+- `tests/`：基于标准库 `unittest` 的分析、路由、RAG、工具、Registry、Tool Client、
+  Agent、Trace、Retry、评测 Runner、页面展示和事实守护测试
 
 API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 原始资料和私有风格示例分别保存在 `data/raw/` 与 `data/private_evaluation/`，两个目录
@@ -52,9 +64,15 @@ API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 # 校验 Stage 05 知识库
 .venv\Scripts\python.exe scripts\validate_knowledge_base.py
 
+# 校验 Stage 08 代表题（不调用 API）
+.venv\Scripts\python.exe evaluation\validate_stage08_agent_cases.py
+
 # 运行全部本地单元测试（不调用 API）
 .venv\Scripts\python.exe -m unittest discover -v
 ```
+
+Stage 08 Runner 默认为 fake 模式；`--mode real` 才会调用当前 Agent 和模型。结果以 JSONL
+断点续跑，并可通过 `evaluation/summarize_stage08_results.py` 输出终端与 Markdown 汇总。
 
 ## Agent 数据流
 
@@ -64,10 +82,13 @@ API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 → QuestionAnalysis 校验
 → Router
 → RouteDecision
-→ 可选 RAG
-→ 模式指令和可选参考资料
-→ 第二次模型调用
-→ 页面展示答案、决策和来源
+→ 可选 RAG，统一准备 context 和 sources
+→ 普通路径：最终回答模型
+→ RAG 路径：context + 最终回答模型
+→ Tool 路径：工具选择模型 → Registry 本地执行 → role=tool 结果回传模型
+→ RAG+Tool 路径：同一次检索 context → 工具选择、本地执行和结果回传
+→ 汇总步骤 Trace 与 AgentRunTrace
+→ 页面展示答案、决策、来源、可选工具记录和运行轨迹
 ```
 
 四种教学模式为 `solve`、`explain`、`hint`、`diagnose`。页面可自动采用 Analyzer
@@ -85,11 +106,25 @@ API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 只提示用户补充题图或完整描述。Analyzer 失败时使用安全默认分析，并在结果中记录
 `analysis_fallback=true`。
 
+Analyzer、工具选择和工具结果回答的 API 调用异常最多重试一次；JSON 解析、Schema、协议、
+参数校验和本地工具错误不重试。工具结果回答重试复用同一份工具记录，不再次执行本地工具。
+每次 Agent 运行汇总总模型请求数、RAG 检索数、本地工具执行数以及各步骤状态和安全错误摘要。
+
+Analyzer 的 `calculation_required=true` 且条件完整时，Router 设置 `use_tools=true`。
+五个白名单工具分别计算平均速度、密度、欧姆定律、电功率和物理单位换算。工具参数先经
+对应 Pydantic Schema 校验；Qwen 返回的纯 JSON 数字字符串只在已登记数值字段中受控
+转换，其余字符串、额外字段和非法参数不会被猜测执行。
+
+普通、RAG、Tool、RAG+Tool 四条路径共用 `run_teacher_agent()`。非工具题通常包含
+Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、工具选择、工具结果回传三次
+模型请求。Registry 的参数校验和物理计算完全在本地执行，不属于模型请求。
+
 ## 会话行为
 
 `st.session_state` 只保存当前浏览器会话/标签页中的消息。新 Assistant 消息保存
-`content`、`sources`、`analysis`、`route` 和 `analysis_fallback`，页面可折叠显示
-Agent 决策和来源；旧格式消息仍能安全显示。
+`content`、`sources`、`analysis`、`route`、`analysis_fallback`、`tool_records`、
+`tool_model_requests` 和 `trace`，页面可折叠显示 Agent 决策、来源、“本地计算工具记录”
+和“Agent 运行轨迹”；旧格式消息仍能安全显示。
 
 浏览器新会话、硬刷新导致会话重建或服务重启后，历史不会持久化。页面显示历史不等于
 模型记忆；每次模型请求仍只发送当前问题，不发送完整页面历史。
@@ -112,7 +147,7 @@ Agent 决策和来源；旧格式消息仍能安全显示。
 - BM25 默认 `top_k=3`、`min_score_ratio=0.3`
 - 检索器固定查询能够命中对应电路、凸透镜和电热器卡片
 - context 注入、无来源回退、sources 顺序和精简字段均有 mock/fake 测试
-- 当前共有 83 项单元测试，全部通过
+- 当前共有 266 项单元测试，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，并真实验证电热器、凸透镜 RAG 问答
 - 加入相对分数过滤后再次验证电热器问题，网页来源只返回 `KB-POWER-001`
 - 页面与终端验证过程中没有出现应用 traceback
@@ -123,6 +158,20 @@ Agent 决策和来源；旧格式消息仍能安全显示。
 - 教师 Prompt 已加入绝对化前提检查、先勘误再回答及条件变化事实守护
 - `KB-ELEC-003` 已补充额定功率定义、额定条件下实际功率相等及白炽灯丝电阻随温度
   变化的说明
+- Stage 07 Function Calling 探针已确认当前 Qwen 接受五个工具定义、返回工具调用，并
+  接受匹配的 `role=tool` 消息
+- Stage 07 统一 Agent 真实 E2E 使用“12 V、6 Ω 求电流”问题：Analyzer 判断
+  `calculation_required=true`，Router 设置 `use_tools=true`、`use_rag=false`，
+  `calculate_ohms_law` 经 Registry 本地执行得到 `2 A`，最终教师回答非空
+- 上述 E2E 中 Analyzer 调用 1 次、Tool Client 调用模型 2 次，整个 Agent 共 3 次模型
+  请求；普通 `answer_question` 路径未被误调用
+- Stage 08 的 8 道真实 Agent 题按 Runner 固定流程各执行一次：7 题 `completed`、1 题缺图
+  `blocked`、0 题失败；8 个 case_id 唯一且 answer、route、trace 等必要字段完整
+- 真实评测预期路由匹配 5/8：S08-AGENT-001 和 S08-AGENT-007 比预期多启用了 RAG，
+  S08-AGENT-002 被判断为 `explain` 而不是预期的 `solve`
+- 真实评测共计 18 次模型请求、4 次 RAG 检索、3 次本地工具执行，平均每题 2.25 次模型请求；
+  无 fallback、Retry 成功步骤、失败、空回答或单题重复工具执行
+- Streamlit Trace 专项测试与完整回归通过，服务启动检查返回 HTTP 200
 
 用户已手动验证：
 
@@ -137,10 +186,15 @@ Agent 决策和来源；旧格式消息仍能安全显示。
 正确性。当前没有向量检索、重排序、系统化召回评测或自动事实校验；真实网页验收目前只
 覆盖普通问答、电热器和凸透镜等少量问题，不能代表完整 RAG 效果。
 
-自动模式通常进行 Analyzer 和最终回答两次模型调用，会增加延迟与费用。Analyzer 仍可能
-发生语义分类错误；Schema 和 Router 只能校验结构和流程，不能验证最终回答的物理事实，
-模型仍可能遗漏预期细节。
+非工具题的自动模式通常进行 Analyzer 和最终回答两次模型调用；工具题通常需要三次模型
+调用，会增加延迟与费用；有限 Retry 在可重试 API 异常时还会增加一次请求。Analyzer 仍可能
+错误判断题型、RAG 或计算需求；Schema、Router 和 Registry 能校验结构、路由与确定性计算
+参数，但不能验证复杂题目的物理建模是否正确，模型仍可能遗漏预期细节。
+
+Stage 08 的 8 道题是工程路径小样本，未对全部回答进行系统人工物理评分，不能代表完整初中
+物理能力。真实评测只有 5/8 路由与人工预期一致，说明自动模式与知识库策略仍可能偏离预期。
 
 当前没有真正的多轮上下文记忆，页面历史不会传入模型，也不会跨浏览器新会话或服务重启
-持久化。当前不支持图片上传和图片理解，`image_required` 只是缺图安全拦截。知识库仍
-只有 10 条卡片，覆盖有限；尚未实现 OCR、向量检索、数据库、工具调用、MCP 或微调。
+持久化。当前工具链一次只执行一个工具，不支持多工具并行、连续工具调用或工具循环。
+当前不支持图片上传和图片理解，`image_required` 只是缺图安全拦截。知识库仍只有 10 条
+卡片，覆盖有限；尚未实现 OCR、向量检索、数据库、长期记忆、MCP 或微调。

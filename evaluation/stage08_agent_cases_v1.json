@@ -1,0 +1,82 @@
+[
+  {
+    "id": "S08-AGENT-001",
+    "category": "普通概念回答",
+    "question": "为什么冬天金属摸起来比木头更凉，但它们温度可能相同？",
+    "expected_teaching_mode": "explain",
+    "expected_use_rag": false,
+    "expected_use_tools": false,
+    "expected_run_status": "completed",
+    "answer_keywords": ["导热", "温度"]
+  },
+  {
+    "id": "S08-AGENT-002",
+    "category": "普通完整解题",
+    "question": "一个物体在水平面上做匀速直线运动，请完整分析它在水平方向上的受力关系。",
+    "expected_teaching_mode": "solve",
+    "expected_use_rag": false,
+    "expected_use_tools": false,
+    "expected_run_status": "completed",
+    "answer_keywords": ["平衡力", "相等"]
+  },
+  {
+    "id": "S08-AGENT-003",
+    "category": "RAG",
+    "question": "结合本地知识库说明并联电路中一条支路电阻变大时电流怎样变化。",
+    "expected_teaching_mode": "explain",
+    "expected_use_rag": true,
+    "expected_use_tools": false,
+    "expected_run_status": "completed",
+    "answer_keywords": ["并联", "电流"]
+  },
+  {
+    "id": "S08-AGENT-004",
+    "category": "Tool",
+    "question": "某电阻两端电压为 12 V，电阻为 6 Ω，求通过它的电流。",
+    "expected_teaching_mode": "solve",
+    "expected_use_rag": false,
+    "expected_use_tools": true,
+    "expected_run_status": "completed",
+    "answer_keywords": ["2", "A"]
+  },
+  {
+    "id": "S08-AGENT-005",
+    "category": "RAG + Tool",
+    "question": "请参考本地知识库，并计算电压为 12 V、电阻为 6 Ω 时的电流。",
+    "expected_teaching_mode": "solve",
+    "expected_use_rag": true,
+    "expected_use_tools": true,
+    "expected_run_status": "completed",
+    "answer_keywords": ["欧姆定律", "2 A"]
+  },
+  {
+    "id": "S08-AGENT-006",
+    "category": "hint",
+    "question": "小车 10 秒行驶 50 米，下一步应该怎么做？只给提示，不要直接说答案。",
+    "expected_teaching_mode": "hint",
+    "expected_use_rag": false,
+    "expected_use_tools": true,
+    "expected_run_status": "completed",
+    "answer_keywords": ["速度", "路程"]
+  },
+  {
+    "id": "S08-AGENT-007",
+    "category": "diagnose",
+    "question": "我写成 I=R/U，这一步哪里错了？只解释错误。",
+    "expected_teaching_mode": "diagnose",
+    "expected_use_rag": false,
+    "expected_use_tools": false,
+    "expected_run_status": "completed",
+    "answer_keywords": ["I=U/R", "颠倒"]
+  },
+  {
+    "id": "S08-AGENT-008",
+    "category": "缺图 blocked",
+    "question": "请根据题图判断滑动变阻器滑片向右移动时电流表如何变化。",
+    "expected_teaching_mode": "solve",
+    "expected_use_rag": false,
+    "expected_use_tools": false,
+    "expected_run_status": "blocked",
+    "answer_keywords": ["题图", "补充"]
+  }
+]

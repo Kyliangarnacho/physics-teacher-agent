@@ -350,6 +350,50 @@ def render_tool_records(message: dict[str, object]) -> None:
                 st.markdown("**error：** 无")
 
 
+def render_run_trace(message: dict[str, object]) -> None:
+    """展示一次 Agent 运行的安全摘要与步骤级观测字段。"""
+    trace = message.get("trace")
+    if not isinstance(trace, dict):
+        return
+
+    with st.expander(
+        "Agent 运行轨迹",
+        expanded=False,
+        icon=":material/timeline:",
+    ):
+        st.markdown(
+            f"**run_id：** `{trace.get('run_id', '')}`  \n"
+            f"**status：** `{trace.get('status', '')}`  \n"
+            f"**total_duration_ms：** `{trace.get('total_duration_ms', 0)}`  \n"
+            f"**total_model_requests：** `{trace.get('total_model_requests', 0)}`  \n"
+            f"**rag_searches：** `{trace.get('rag_searches', 0)}`  \n"
+            f"**tool_executions：** `{trace.get('tool_executions', 0)}`  \n"
+            f"**analysis_fallback：** `{trace.get('analysis_fallback', False)}`"
+        )
+
+        steps = trace.get("steps", [])
+        if not isinstance(steps, list):
+            return
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            st.divider()
+            st.markdown(
+                f"**步骤 {index} · {step.get('name', '')}**  \n"
+                f"**status：** `{step.get('status', '')}`  \n"
+                f"**attempts：** `{step.get('attempts', 0)}`  \n"
+                f"**duration_ms：** `{step.get('duration_ms', 0)}`  \n"
+                f"**model_requests：** `{step.get('model_requests', 0)}`"
+            )
+            error_type = step.get("error_type")
+            error_message = step.get("error_message")
+            if error_type or error_message:
+                st.markdown(
+                    f"**error_type：** `{error_type or ''}`  \n"
+                    f"**error_message：** {error_message or ''}"
+                )
+
+
 def render_chat_message(message: dict[str, object], message_index: int) -> None:
     """使用无头像的左右气泡渲染一条聊天消息。"""
     role = str(message.get("role", "assistant"))
@@ -365,6 +409,7 @@ def render_chat_message(message: dict[str, object], message_index: int) -> None:
                 render_rag_sources(message)
                 render_agent_decision(message)
                 render_tool_records(message)
+                render_run_trace(message)
 
 
 st.set_page_config(
@@ -514,6 +559,7 @@ if not is_empty_state and response_slot is not None:
                         "tool_model_requests",
                         0,
                     ),
+                    "trace": agent_result.get("trace"),
                 }
                 st.session_state.messages.append(assistant_message)
                 with response_slot.container():

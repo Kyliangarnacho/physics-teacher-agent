@@ -1,4 +1,4 @@
-"""Stage 06 的最小问题路由规则。"""
+"""初中物理教师 Agent 的教学模式、RAG 与工具路由规则。"""
 
 from src.schemas import QuestionAnalysis, RouteDecision, TeachingMode
 

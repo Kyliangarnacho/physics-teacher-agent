@@ -171,11 +171,16 @@ class ToolClientTests(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_completion_exception_returns_safe_result_without_traceback(self):
-        fake = FakeCompletion([RuntimeError("private internal detail")])
+        fake = FakeCompletion(
+            [
+                RuntimeError("private internal detail"),
+                RuntimeError("private internal detail again"),
+            ]
+        )
 
         result = answer_with_tools("求电流。", completion_func=fake)
 
-        self.assertEqual(result["model_requests"], 1)
+        self.assertEqual(result["model_requests"], 2)
         self.assertEqual(result["tool_records"], [])
         self.assertNotIn("private", result["answer"])
 
