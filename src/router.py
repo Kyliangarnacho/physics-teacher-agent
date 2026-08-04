@@ -11,6 +11,7 @@ def route_question(
     analysis: QuestionAnalysis,
     mode_override: str = "auto",
     rag_policy: str = "auto",
+    image_context_available: bool = False,
 ) -> RouteDecision:
     """根据结构化问题分析和用户策略生成路由决策。"""
     if mode_override not in VALID_MODE_OVERRIDES:
@@ -19,6 +20,8 @@ def route_question(
         )
     if rag_policy not in VALID_RAG_POLICIES:
         raise ValueError("rag_policy 必须是 auto、force 或 off。")
+    if not isinstance(image_context_available, bool):
+        raise ValueError("image_context_available 必须是布尔值。")
 
     teaching_mode = (
         analysis.teaching_mode
@@ -26,7 +29,7 @@ def route_question(
         else TeachingMode(mode_override)
     )
 
-    if analysis.image_required:
+    if analysis.image_required and not image_context_available:
         return RouteDecision(
             teaching_mode=teaching_mode,
             use_rag=False,

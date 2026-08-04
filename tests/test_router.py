@@ -89,6 +89,21 @@ class RouteQuestionTests(unittest.TestCase):
         self.assertIn("题图", decision.user_message)
         self.assertIn("描述", decision.user_message)
 
+    def test_confirmed_image_context_allows_image_required_question(self) -> None:
+        decision = route_question(
+            make_analysis(
+                image_required=True,
+                needs_rag=True,
+                calculation_required=True,
+            ),
+            image_context_available=True,
+        )
+
+        self.assertTrue(decision.should_answer)
+        self.assertTrue(decision.use_rag)
+        self.assertTrue(decision.use_tools)
+        self.assertIsNone(decision.user_message)
+
     def test_missing_conditions_still_allows_answer(self) -> None:
         decision = route_question(make_analysis(missing_conditions=True))
 

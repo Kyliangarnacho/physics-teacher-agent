@@ -1,18 +1,18 @@
 # 当前状态
 
-## Stage 08 状态
+## Stage 09 状态
 
 “初中物理教师 Agent + 阿里云百炼千问 API”当前使用 `qwen3.7-flash`，提示词版本仍为
-`teacher_v3_personal_humor`。Stage 08 已在 Stage 07 的五个本地计算工具、白名单 Tool
-Registry、Qwen Function Calling 与四条统一 Agent 路径基础上，加入结构化 Trace、一次有限
-Retry、8 题评测 Runner、结果汇总和网页运行轨迹展示。
+`teacher_v3_personal_humor`。Stage 09 已在既有 Router、RAG、Tool、有限 Retry 与 Trace
+基础上加入视觉理解、可选 OCR、最多 3 张图片的 Batch、附件与 Ctrl+V 粘贴，以及清晰内容
+自动采用、不确定内容人工确认的页面流程。
 
 当前个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心。幽默仅在语境自然匹配时
 偶尔出现，不要求每题都有。
 
 ## 当前结构
 
-- `app.py`：Streamlit 页面入口，统一调用 Agent，保存并重渲染回答、决策、来源和工具记录
+- `app.py`：Streamlit 文本/多图片聊天入口，编排视觉识别、人工确认和统一 Agent
 - `main.py`：固定平均速度题的终端回归入口
 - `src/config.py`：使用 `python-dotenv` 加载并校验千问配置
 - `src/schemas.py`：定义教学模式、带计算需求的分析结果和带工具决策的路由结果
@@ -31,6 +31,9 @@ Retry、8 题评测 Runner、结果汇总和网页运行轨迹展示。
   API 调用可有限重试且不会重复执行成功的本地工具
 - `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并定义统一安全错误类别
 - `src/retry.py`：提供至多重试一次的通用有限 Retry
+- `src/vision/`：图片预处理、视觉/OCR Client、结果合并、安全上下文及多图 Batch
+- `src/ui/paste_images.py`：图片粘贴辅助和哈希去重；原生附件上传仍可独立使用
+- `scripts/probe_stage09_vision.py`：视觉模型结构化提取能力的人工诊断探针
 - `scripts/probe_stage07_function_calling.py`：底层 Function Calling 人工诊断探针
 - `scripts/probe_stage07_agent_e2e.py`：统一 Agent 真实端到端验收探针
 - `scripts/validate_knowledge_base.py`：校验知识库 JSONL、字段、类型和 ID 唯一性
@@ -42,12 +45,28 @@ Retry、8 题评测 Runner、结果汇总和网页运行轨迹展示。
 - `evaluation/reviews/`：人工评审表和新旧版本对比
 - `evaluation/validate_stage04_text_cases.py`：评测数据校验入口
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit`、独立输出文件和断点续跑
-- `tests/`：基于标准库 `unittest` 的分析、路由、RAG、工具、Registry、Tool Client、
-  Agent、Trace、Retry、评测 Runner、页面展示和事实守护测试
+- `tests/`：基于标准库 `unittest` 的分析、路由、RAG、工具、Agent、Trace、Retry、
+  视觉/OCR、多图交互、页面展示和评测 Runner 测试
 
 API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 原始资料和私有风格示例分别保存在 `data/raw/` 与 `data/private_evaluation/`，两个目录
 均被 Git 忽略且不会提交。
+
+## 图片数据流
+
+```text
+文字与最多 3 张图片（附件或 Ctrl+V）
+→ 图片内存预处理与同批去重
+→ 每张图片独立 Vision 提取
+→ 按需执行可选 OCR 并合并
+→ 清晰结果自动采用；不确定结果等待一次人工确认
+→ 按图片顺序构造已确认上下文
+→ Analyzer → Router → 可选 RAG / Tool → 最终回答
+→ 页面展示安全识别元数据、来源、工具记录和 Trace
+```
+
+图片原始字节、Data URL、Base64 和完整确认上下文不会写入聊天历史或 Trace。上传新 Batch 或
+完成一次发送后，不会让上一批图片自动进入下一轮纯文字问题。
 
 ## 运行命令
 
@@ -147,7 +166,7 @@ Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、�
 - BM25 默认 `top_k=3`、`min_score_ratio=0.3`
 - 检索器固定查询能够命中对应电路、凸透镜和电热器卡片
 - context 注入、无来源回退、sources 顺序和精简字段均有 mock/fake 测试
-- 当前共有 266 项单元测试，全部通过
+- 当前共有 393 项单元测试，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，并真实验证电热器、凸透镜 RAG 问答
 - 加入相对分数过滤后再次验证电热器问题，网页来源只返回 `KB-POWER-001`
 - 页面与终端验证过程中没有出现应用 traceback
@@ -172,6 +191,8 @@ Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、�
 - 真实评测共计 18 次模型请求、4 次 RAG 检索、3 次本地工具执行，平均每题 2.25 次模型请求；
   无 fallback、Retry 成功步骤、失败、空回答或单题重复工具执行
 - Streamlit Trace 专项测试与完整回归通过，服务启动检查返回 HTTP 200
+- Stage 09 的单图、多图、图片无文字默认问题、可选 OCR、自适应确认、缓存去重、图片上下文
+  进入 RAG/Tool，以及附件与粘贴图片合并均有测试覆盖
 
 用户已手动验证：
 
@@ -196,5 +217,6 @@ Stage 08 的 8 道题是工程路径小样本，未对全部回答进行系统�
 
 当前没有真正的多轮上下文记忆，页面历史不会传入模型，也不会跨浏览器新会话或服务重启
 持久化。当前工具链一次只执行一个工具，不支持多工具并行、连续工具调用或工具循环。
-当前不支持图片上传和图片理解，`image_required` 只是缺图安全拦截。知识库仍只有 10 条
-卡片，覆盖有限；尚未实现 OCR、向量检索、数据库、长期记忆、MCP 或微调。
+图片理解仍可能受清晰度、手写内容和复杂图形影响；一次最多处理 3 张图片，OCR 只有在本地
+配置可用模型时才启用，不确定结果仍需人工确认。知识库仍只有 10 条卡片；尚未实现向量检索、
+数据库、长期记忆、MCP、微调或通用跨图片语义推理。

@@ -2,26 +2,26 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 08：在
-Stage 07 本地工具与统一 Agent 基础上，加入结构化运行 Trace、一次有限 Retry、可断点续跑的
-8 题评测 Runner、结果汇总和网页运行轨迹展示。当前模型为 `qwen3.7-flash`，提示词版本仍为
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 09：在既有
+Router、RAG、Tool、有限 Retry 和 Trace 基础上，加入图片视觉理解、可选 OCR、多图片聊天和
+人工确认流程。当前文本模型为 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。
 
 ## 环境与配置
 
 - Python 3.12 虚拟环境：`.venv`
-- 主要依赖：`openai`、`python-dotenv`、`streamlit`、`pydantic`、`jieba`、
+- 主要依赖：`openai`、`python-dotenv`、`streamlit`、`pydantic`、`Pillow`、`jieba`、
   `rank-bm25`
 - 本地配置：`.env`
 - 当前模型：`qwen3.7-flash`
 
-`.env` 保存 `DASHSCOPE_API_KEY`、`QWEN_BASE_URL` 和 `QWEN_MODEL`，已被 Git
-忽略且不会提交。可复制 `.env.example` 后填写本地 API Key。
+`.env` 保存本地 API Key、Base URL 及文本/视觉/OCR 模型配置，已被 Git 忽略且不会提交。
+可复制 `.env.example` 后填写本地配置；OCR 模型未配置时会安全跳过 OCR 增强。
 
 ## 代码职责
 
-- `app.py`：提供 Streamlit 聊天页面，调用统一 Agent，并保存回答、分析、路由、来源和
-  本地工具执行记录
+- `app.py`：提供 Streamlit 文本/多图片聊天页面，调用视觉服务和统一 Agent，并保存安全的
+  回答、决策、来源、工具记录和 Trace
 - `main.py`：运行固定平均速度题，作为终端回归入口
 - `src/config.py`：加载并校验 `.env` 中的千问配置
 - `src/schemas.py`：定义 `TeachingMode`、带 `calculation_required` 的
@@ -40,6 +40,9 @@ Stage 07 本地工具与统一 Agent 基础上，加入结构化运行 Trace、�
 - `src/tool_client.py`：执行单工具、两轮 Qwen Function Calling，并返回工具记录
 - `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并统一记录安全错误类型
 - `src/retry.py`：提供至多重试一次的通用有限 Retry，不负责业务错误分类
+- `src/vision/`：负责图片内存预处理、视觉提取、可选 OCR、结果合并、多图 Batch 与安全上下文
+- `src/ui/paste_images.py`：提供图片粘贴辅助与哈希去重；页面同时保留原生附件上传能力
+- `scripts/probe_stage09_vision.py`：人工验证视觉模型、多模态消息和结构化提取能力
 - `scripts/probe_stage07_function_calling.py`：人工验证底层 Function Calling 兼容链路
 - `scripts/probe_stage07_agent_e2e.py`：人工验证统一 Agent 的真实工具端到端链路
 - `scripts/validate_knowledge_base.py`：校验知识卡片的 JSON、字段、类型和重复 ID
@@ -52,7 +55,20 @@ Stage 07 本地工具与统一 Agent 基础上，加入结构化运行 Trace、�
 - `evaluation/validate_stage04_text_cases.py`：校验题目字段、数量和 ID
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit` 和断点续跑的评测入口
 - `tests/`：使用 Python 标准库 `unittest` 验证 Schema、Analyzer、Router、Agent、
-  检索、RAG、工具计算、Registry、Tool Client、Trace、Retry、评测 Runner、页面展示和事实守护
+  检索、RAG、工具计算、Registry、Tool Client、Trace、Retry、视觉/OCR、多图页面和评测 Runner
+
+## Stage 09 图片理解与多图聊天
+
+Stage 09 当前实现：
+
+- 支持 JPEG、PNG、WEBP 图片的内存校验、EXIF 方向处理、尺寸约束和安全 Data URL 请求构造
+- Vision Client 只提取题意与视觉关系；OCR 为可选增强，不负责解题或猜测图形连接
+- 聊天输入支持纯文字、附件和 Ctrl+V 图片粘贴，一次最多 3 张图片，并按 SHA-256 去重
+- 每张图独立识别并按上传顺序组成 Batch；清晰且无不确定项时自动进入 Agent
+- `needs_confirmation` 或存在不确定项时暂停回答，让用户编辑并一次确认；`unreadable` 阻止提交
+- 确认后的安全图片上下文复用现有 Analyzer、Router、RAG、Tool、Retry 与 Trace 链路
+- 会话消息只保存文件名、哈希、Batch/视觉运行 ID 等安全元数据，不保存原图、Data URL、
+  Base64 或完整图片上下文
 
 ## Stage 08 Trace、有限 Retry 与评测
 
@@ -238,7 +254,7 @@ API 配置与费用时执行。
   `content`
 - Stage 05 知识库 10 条卡片通过结构与唯一性校验
 - 检索、RAG 编排和 context 消息均由 fake/mock 测试覆盖，不调用千问
-- 当前全部单元测试为 266 项，全部通过
+- 当前全部单元测试为 393 项，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，页面与终端没有出现应用 traceback
 - 已真实验证电热器和凸透镜 RAG 问答；加入相对分数过滤后再次验证电热器问题，网页来源
   只返回 `KB-POWER-001`
@@ -256,6 +272,8 @@ API 配置与费用时执行。
 - Stage 08 的 8 道真实 Agent 评测只运行一轮：7 题完成、1 题缺图拦截、0 题失败，预期路由
   匹配 5/8；总模型请求 18 次、RAG 检索 4 次、本地工具执行 3 次，无 fallback、Retry 或空回答
 - Stage 08 Streamlit Trace 专项测试通过，服务启动检查返回 HTTP 200
+- Stage 09 单图、多图、可选 OCR、自适应确认、图片上下文进入 RAG/Tool、附件与粘贴去重均有
+  本地测试覆盖；完整回归为 393/393
 
 用户手动验证的网页结果：
 
@@ -281,5 +299,6 @@ Stage 08 的 8 道题只覆盖代表性工程路径，不是完整初中物理�
 
 模型每次仍只接收当前问题，没有真正的多轮上下文记忆；页面显示历史不等于模型记忆。
 当前工具链一次只允许执行一个工具，不支持多个或并行工具调用，也不支持工具调用循环。
-当前不支持图片上传或图片理解，`image_required` 只是缺图安全拦截。知识库仍只有 10 条
-文本卡片，BM25 覆盖有限。当前也未实现 OCR、数据库、长期记忆、MCP 或微调。
+图片理解依赖视觉模型输出，模糊文字、手写内容和复杂图形仍可能需要人工确认；一次提交最多
+3 张图片，OCR 仅在已配置可用模型时启用。知识库仍只有 10 条文本卡片，BM25 覆盖有限。
+当前未实现数据库、长期记忆、MCP、微调或通用的跨图片语义推理。

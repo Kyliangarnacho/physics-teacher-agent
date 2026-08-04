@@ -1,8 +1,17 @@
-"""初中物理教师 Agent 的最小 Streamlit 聊天页面。"""
+"""初中物理教师 Agent 的 Streamlit 聊天页面。"""
 
 import streamlit as st
 
-from src.agent import run_teacher_agent
+from src import agent as agent_module
+from src.ui.paste_images import decode_pasted_images
+from src.vision.batch import (
+    build_batch_image_context,
+    image_is_unreadable,
+    image_needs_confirmation,
+    merge_image_inputs,
+    process_image_batch,
+)
+from src.vision.context import build_image_context_draft
 
 
 MODEL_ERROR_MESSAGES = {
@@ -27,6 +36,15 @@ RAG_POLICY_OPTIONS = {
     "force": "强制使用",
     "off": "不使用",
 }
+
+VISION_MODE_OPTIONS = {
+    "auto": "自动判断",
+    "vision": "仅综合视觉",
+    "ocr_enhanced": "OCR 增强",
+}
+
+PASTE_BRIDGE_KEY = "paste_image_bridge"
+DEFAULT_IMAGE_QUESTION = "请分析并解答这些图片中的物理问题。"
 
 
 APP_STYLES = """
@@ -79,6 +97,11 @@ APP_STYLES = """
 [data-testid="stChatInput"]:focus-within {
     border-color: #c7c7c7;
     box-shadow: 0 8px 28px rgb(0 0 0 / 9%);
+}
+
+.st-key-paste_image_bridge {
+    width: min(calc(100vw - 2rem), 650px);
+    margin: 0 auto 0.45rem;
 }
 
 [data-testid="stAppViewContainer"]:has(.st-key-empty_state)
@@ -190,19 +213,110 @@ section[data-testid="stSidebar"] {
     [class*="st-key-assistant_message_bubble_"] {
         max-width: 100%;
     }
+
+    .st-key-paste_image_bridge {
+        width: calc(100vw - 1.6rem);
+    }
 }
 </style>
 """
 
 
 def clear_conversation() -> None:
-    """清空当前浏览器会话中的聊天记录。"""
+    """Clear chat plus unsent image work, without deleting the safe cache."""
     st.session_state.messages = []
+    for key in (
+        "pending_chat_submission",
+        "pending_submission",
+        PASTE_BRIDGE_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if str(key).startswith("pending_image_draft_"):
+            st.session_state.pop(key, None)
+    st.session_state.paste_bridge_reset_token = (
+        int(st.session_state.get("paste_bridge_reset_token", 0)) + 1
+    )
 
 
-def queue_question(input_key: str) -> None:
-    """将聊天输入暂存到下一次脚本运行中。"""
-    st.session_state.pending_question = st.session_state.get(input_key)
+def queue_chat_submission(input_key: str) -> None:
+    """Copy one native chat submission and pending pasted bytes for processing."""
+    value = st.session_state.get(input_key)
+    if isinstance(value, str):
+        text = value
+        files = []
+    else:
+        text = getattr(value, "text", "")
+        files = getattr(value, "files", [])
+
+    attached_images: list[dict[str, object]] = []
+    if isinstance(files, list):
+        for file in files:
+            getvalue = getattr(file, "getvalue", None)
+            filename = getattr(file, "name", "")
+            if callable(getvalue) and isinstance(filename, str):
+                attached_images.append(
+                    {
+                        "filename": filename,
+                        "mime_type": str(getattr(file, "type", "")),
+                        "bytes": getvalue(),
+                    }
+                )
+
+    pasted_images = decode_pasted_images(
+        st.session_state.get(PASTE_BRIDGE_KEY)
+    )
+    if str(text).strip() or pasted_images or attached_images:
+        st.session_state.pending_chat_submission = {
+            "text": str(text),
+            "pasted_images": pasted_images,
+            "attached_images": attached_images,
+        }
+    st.session_state.pop(PASTE_BRIDGE_KEY, None)
+    st.session_state.paste_bridge_reset_token = (
+        int(st.session_state.get("paste_bridge_reset_token", 0)) + 1
+    )
+
+
+def render_batch_details(batch: dict[str, object]) -> None:
+    """Show safe visual metadata and traces in a collapsed area."""
+    images = batch.get("images", [])
+    if not isinstance(images, list) or not images:
+        return
+    with st.expander(
+        "题图识别详情",
+        expanded=False,
+        icon=":material/image_search:",
+    ):
+        for position, record in enumerate(images, start=1):
+            if not isinstance(record, dict):
+                continue
+            if position > 1:
+                st.divider()
+            extraction = record.get("extraction")
+            status = getattr(getattr(extraction, "status", ""), "value", "")
+            image_type = getattr(
+                getattr(extraction, "image_type", ""),
+                "value",
+                "",
+            )
+            st.markdown(
+                f"**图片 {record.get('index', position)} · "
+                f"{record.get('filename', '')}**  \n"
+                f"状态：`{status}` · 类型：`{image_type}` · "
+                f"OCR：`{'已使用' if record.get('ocr_used') else '未使用'}` · "
+                f"模型请求：`{record.get('model_requests', 0)}`"
+            )
+            traces = record.get("vision_step_traces", [])
+            if isinstance(traces, list):
+                for step in traces:
+                    if not isinstance(step, dict):
+                        continue
+                    st.caption(
+                        f"{step.get('name', '')}: {step.get('status', '')}, "
+                        f"attempts={step.get('attempts', 0)}, "
+                        f"model_requests={step.get('model_requests', 0)}"
+                    )
 
 
 def render_rag_sources(message: dict[str, object]) -> None:
@@ -412,6 +526,160 @@ def render_chat_message(message: dict[str, object], message_index: int) -> None:
                 render_run_trace(message)
 
 
+def _image_history_metadata(
+    batch: dict[str, object] | None,
+    *,
+    context_used: bool,
+) -> dict[str, object]:
+    """Build history-safe image metadata without bytes or extracted context."""
+    if not isinstance(batch, dict):
+        return {
+            "image_count": 0,
+            "image_filenames": [],
+            "image_hash": [],
+            "batch_id": None,
+            "image_context_used": False,
+            "vision_run_id": [],
+        }
+    images = batch.get("images", [])
+    records = images if isinstance(images, list) else []
+    return {
+        "image_count": len(records),
+        "image_filenames": [
+            str(record.get("filename", ""))
+            for record in records
+            if isinstance(record, dict)
+        ],
+        "image_hash": [
+            str(record.get("image_hash", ""))
+            for record in records
+            if isinstance(record, dict)
+        ],
+        "batch_id": batch.get("batch_id"),
+        "image_context_used": context_used,
+        "vision_run_id": [
+            str(record.get("vision_run_id", ""))
+            for record in records
+            if isinstance(record, dict)
+        ],
+    }
+
+
+def _pending_draft_key(batch_id: str, image_index: int) -> str:
+    return f"pending_image_draft_{batch_id}_{image_index}"
+
+
+def _clear_pending_submission() -> None:
+    pending = st.session_state.pop("pending_submission", None)
+    if not isinstance(pending, dict):
+        return
+    batch = pending.get("batch")
+    if not isinstance(batch, dict):
+        return
+    batch_id = str(batch.get("batch_id", ""))
+    images = batch.get("images", [])
+    if isinstance(images, list):
+        for record in images:
+            if isinstance(record, dict) and isinstance(record.get("index"), int):
+                st.session_state.pop(
+                    _pending_draft_key(batch_id, record["index"]),
+                    None,
+                )
+
+
+def _store_pending_submission(
+    question: str,
+    batch: dict[str, object],
+) -> None:
+    """Store only safe extraction results and editable drafts, never bytes."""
+    st.session_state.pending_submission = {
+        "question": question,
+        "batch": batch,
+    }
+    batch_id = str(batch.get("batch_id", ""))
+    images = batch.get("images", [])
+    if not isinstance(images, list):
+        return
+    for record in images:
+        if not isinstance(record, dict) or not image_needs_confirmation(record):
+            continue
+        extraction = record.get("extraction")
+        index = record.get("index")
+        if isinstance(index, int):
+            st.session_state[
+                _pending_draft_key(batch_id, index)
+            ] = build_image_context_draft(extraction)
+
+
+def render_pending_confirmation() -> dict[str, object] | None:
+    """Render only ambiguous images and return a confirmed Agent payload."""
+    pending = st.session_state.get("pending_submission")
+    if not isinstance(pending, dict):
+        return None
+    question = pending.get("question")
+    batch = pending.get("batch")
+    if not isinstance(question, str) or not isinstance(batch, dict):
+        return None
+    images = batch.get("images", [])
+    if not isinstance(images, list):
+        return None
+
+    st.warning("部分题图需要你核对。确认前不会调用教师 Agent。")
+    render_batch_details(batch)
+    batch_id = str(batch.get("batch_id", ""))
+    confirmation_records = [
+        record
+        for record in images
+        if isinstance(record, dict) and image_needs_confirmation(record)
+    ]
+    for record in confirmation_records:
+        index = record.get("index")
+        filename = record.get("filename", "")
+        if not isinstance(index, int):
+            continue
+        with st.expander(
+            f"核对图片 {index}：{filename}",
+            expanded=True,
+            icon=":material/edit_note:",
+        ):
+            st.text_area(
+                "可编辑图片上下文",
+                key=_pending_draft_key(batch_id, index),
+                height=220,
+            )
+
+    if st.button(
+        "确认并发送",
+        key=f"confirm_batch_{batch_id}",
+        type="primary",
+        width="stretch",
+    ):
+        overrides: dict[int, str] = {}
+        for record in confirmation_records:
+            index = record.get("index")
+            if not isinstance(index, int):
+                continue
+            draft = str(
+                st.session_state.get(
+                    _pending_draft_key(batch_id, index),
+                    "",
+                )
+            ).strip()
+            if not draft:
+                st.warning(f"图片 {index} 的确认内容不能为空。")
+                return None
+            overrides[index] = draft
+        return {
+            "question": question,
+            "batch": batch,
+            "image_context": build_batch_image_context(
+                images,
+                context_overrides=overrides,
+            ),
+        }
+    return None
+
+
 st.set_page_config(
     page_title="初中物理教师 Agent",
     page_icon=":material/science:",
@@ -420,9 +688,11 @@ st.set_page_config(
 )
 st.html(APP_STYLES)
 st.session_state.setdefault("messages", [])
-queued_question = st.session_state.pop("pending_question", None)
-question_to_answer = None
-question_error = None
+st.session_state.setdefault("vision_batch_cache", {})
+st.session_state.setdefault("paste_bridge_reset_token", 0)
+queued_submission = st.session_state.pop("pending_chat_submission", None)
+submission_to_process = None
+submission_error = None
 mode_override_for_question = str(
     st.session_state.get("teaching_mode", "auto")
 )
@@ -430,18 +700,38 @@ rag_policy_for_question = str(
     st.session_state.get("rag_policy", "auto")
 )
 
-if queued_question is not None:
-    normalized_question = str(queued_question).strip()
-    if normalized_question:
-        question_to_answer = normalized_question
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": normalized_question,
-            }
+if isinstance(queued_submission, dict):
+    try:
+        queued_images = merge_image_inputs(
+            queued_submission.get("pasted_images", []),
+            queued_submission.get("attached_images", []),
         )
+    except ValueError as exc:
+        submission_error = str(exc)
     else:
-        question_error = "问题不能为空，请输入一道初中物理问题。"
+        submitted_text = str(queued_submission.get("text", "")).strip()
+        if submitted_text or queued_images:
+            normalized_question = submitted_text or DEFAULT_IMAGE_QUESTION
+            submission_to_process = {
+                "question": normalized_question,
+                "images": queued_images,
+            }
+            st.session_state.messages.append(
+                {
+                    "role": "user",
+                    "content": normalized_question,
+                    "image_count": len(queued_images),
+                    "image_filenames": [
+                        str(item["filename"]) for item in queued_images
+                    ],
+                    "image_hash": [
+                        str(item["raw_hash"]) for item in queued_images
+                    ],
+                    "batch_id": None,
+                    "image_context_used": False,
+                    "vision_run_id": [],
+                }
+            )
 
 with st.sidebar:
     st.markdown("**初中物理教师**")
@@ -496,72 +786,181 @@ with st.sidebar:
         f"{RAG_POLICY_OPTIONS[rag_policy]}"
     )
 
+    st.divider()
+    st.markdown("##### 题图识别设置")
+    vision_mode = st.selectbox(
+        "识别模式",
+        options=list(VISION_MODE_OPTIONS),
+        format_func=VISION_MODE_OPTIONS.get,
+        key="vision_mode",
+    )
+    vision_instruction = st.text_input(
+        "识别重点（可选）",
+        key="vision_instruction",
+        placeholder="例如：重点核对电路连接和电表量程",
+    )
+    st.caption("在聊天框粘贴或选择图片，发送后才会开始识别。")
+
 is_empty_state = (
     not st.session_state.messages
-    and question_to_answer is None
+    and submission_to_process is None
+    and st.session_state.get("pending_submission") is None
 )
 response_slot = None
 
 if is_empty_state:
     with st.container(key="empty_state"):
         st.markdown("## 今天想从哪道物理题开始？")
-        if question_error:
-            st.warning(question_error)
+        if submission_error:
+            st.warning(submission_error)
 else:
     for message_index, message in enumerate(st.session_state.messages):
         render_chat_message(message, message_index)
 
     response_slot = st.empty()
 
+pending_agent_payload = None
+if st.session_state.get("pending_submission") is not None:
+    pending_agent_payload = render_pending_confirmation()
+
 st.chat_input(
     "把题目或困惑发过来"
     if is_empty_state
     else "继续问一道物理问题…",
     key="question_input",
-    on_submit=queue_question,
+    accept_file="multiple",
+    file_type=["jpg", "jpeg", "png", "webp"],
+    max_upload_size=8,
+    submit_mode="disable",
+    disabled=st.session_state.get("pending_submission") is not None,
+    on_submit=queue_chat_submission,
     args=("question_input",),
 )
 
-if not is_empty_state and response_slot is not None:
-    if question_error:
-        with response_slot.container():
-            st.warning(question_error)
-    elif question_to_answer is not None:
+agent_payload = pending_agent_payload
+if submission_error and response_slot is not None:
+    with response_slot.container():
+        st.warning(submission_error)
+
+if submission_to_process is not None:
+    question = str(submission_to_process["question"])
+    images = submission_to_process["images"]
+    if images:
         try:
-            with response_slot.container():
-                with st.spinner("教师正在思考，请稍候……"):
-                    agent_result = run_teacher_agent(
-                        question_to_answer,
-                        mode_override=mode_override_for_question,
-                        rag_policy=rag_policy_for_question,
-                    )
-                    answer = agent_result["answer"]
+            with st.status(
+                f"正在读取 {len(images)} 张题图",
+                expanded=False,
+            ) as image_status:
+                batch = process_image_batch(
+                    images,
+                    mode=vision_mode,
+                    user_instruction=vision_instruction,
+                    cache=st.session_state.vision_batch_cache,
+                    progress_func=lambda index, total: st.write(
+                        f"正在识别图片 {index}/{total}"
+                    ),
+                )
+                image_status.update(label="题图识别完成", state="complete")
         except Exception:
+            if response_slot is not None:
+                with response_slot.container():
+                    st.error("题图处理失败，请检查图片后重新发送。")
+        else:
+            batch_images = batch.get("images", [])
+            if any(image_is_unreadable(record) for record in batch_images):
+                if response_slot is not None:
+                    with response_slot.container():
+                        st.error("有题图无法识别，请移除或替换后重新发送。")
+                        render_batch_details(batch)
+            elif any(
+                image_needs_confirmation(record) for record in batch_images
+            ):
+                _store_pending_submission(question, batch)
+                if response_slot is not None:
+                    with response_slot.container():
+                        render_pending_confirmation()
+            else:
+                render_batch_details(batch)
+                agent_payload = {
+                    "question": question,
+                    "batch": batch,
+                    "image_context": build_batch_image_context(batch_images),
+                }
+    else:
+        agent_payload = {
+            "question": question,
+            "batch": None,
+            "image_context": None,
+        }
+
+if agent_payload is not None:
+    question = str(agent_payload["question"])
+    batch = agent_payload.get("batch")
+    image_context = agent_payload.get("image_context")
+    try:
+        with st.spinner("正在生成讲解……"):
+            if isinstance(image_context, str) and image_context.strip():
+                agent_result = agent_module.run_teacher_agent(
+                    question,
+                    mode_override=mode_override_for_question,
+                    rag_policy=rag_policy_for_question,
+                    image_context=image_context,
+                    image_context_available=True,
+                )
+            else:
+                agent_result = agent_module.run_teacher_agent(
+                    question,
+                    mode_override=mode_override_for_question,
+                    rag_policy=rag_policy_for_question,
+                )
+            answer = agent_result["answer"]
+    except Exception:
+        if response_slot is not None:
             with response_slot.container():
                 st.error("回答生成失败，请稍后再试。")
-        else:
-            if answer in MODEL_ERROR_MESSAGES:
+    else:
+        if answer in MODEL_ERROR_MESSAGES:
+            if response_slot is not None:
                 with response_slot.container():
                     st.error(answer)
-            else:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": answer,
-                    "sources": agent_result.get("sources", []),
-                    "analysis": agent_result.get("analysis", {}),
-                    "route": agent_result.get("route", {}),
-                    "analysis_fallback": agent_result.get(
-                        "analysis_fallback",
-                        False,
-                    ),
-                    "tool_records": agent_result.get("tool_records", []),
-                    "tool_model_requests": agent_result.get(
-                        "tool_model_requests",
-                        0,
-                    ),
-                    "trace": agent_result.get("trace"),
-                }
-                st.session_state.messages.append(assistant_message)
+        else:
+            metadata = _image_history_metadata(
+                batch if isinstance(batch, dict) else None,
+                context_used=isinstance(image_context, str),
+            )
+            assistant_message = {
+                "role": "assistant",
+                "content": answer,
+                "sources": agent_result.get("sources", []),
+                "analysis": agent_result.get("analysis", {}),
+                "route": agent_result.get("route", {}),
+                "analysis_fallback": agent_result.get(
+                    "analysis_fallback",
+                    False,
+                ),
+                "tool_records": agent_result.get("tool_records", []),
+                "tool_model_requests": agent_result.get(
+                    "tool_model_requests",
+                    0,
+                ),
+                "trace": agent_result.get("trace"),
+                **metadata,
+            }
+            if isinstance(batch, dict):
+                batch_metadata = _image_history_metadata(
+                    batch,
+                    context_used=True,
+                )
+                for message in reversed(st.session_state.messages):
+                    if (
+                        message.get("role") == "user"
+                        and message.get("batch_id") is None
+                    ):
+                        message.update(batch_metadata)
+                        break
+            st.session_state.messages.append(assistant_message)
+            _clear_pending_submission()
+            if response_slot is not None:
                 with response_slot.container():
                     render_chat_message(
                         assistant_message,
