@@ -6,3 +6,7 @@ __pycache__/
 .vscode/
 data/raw/
 data/private_evaluation/
+data/runtime/
+*.db
+*.db-shm
+*.db-wal

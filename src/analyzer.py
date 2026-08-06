@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable
 
@@ -7,6 +8,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from src.config import load_qwen_config
+from src.model_client import build_conversation_messages
 from src.observability import ErrorType, StepTimer
 from src.prompts import QUESTION_ANALYZER_SYSTEM_PROMPT
 from src.retry import run_with_one_retry
@@ -31,15 +33,63 @@ def _safe_default_analysis() -> QuestionAnalysis:
     )
 
 
-def _call_analyzer_model(question: str) -> str:
+def _invoke_analyze_func(
+    analyze_func: AnalyzeFunc,
+    question: str,
+    *,
+    teaching_state_context: str | None,
+    learning_memory_context: str | None,
+    conversation_history: list[dict[str, str]] | None,
+) -> str:
+    """以兼容方式调用注入的分析函数。
+
+    支持新上下文的函数会收到 teaching_state_context / conversation_history；
+    旧签名（只有 question）的函数保持 Stage 09 原调用方式。
+    """
+    try:
+        signature = inspect.signature(analyze_func)
+    except (TypeError, ValueError):
+        return analyze_func(question)
+    parameters = signature.parameters
+    has_var_keyword = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    )
+    supported = {
+        name
+        for name, param in parameters.items()
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    kwargs: dict[str, object] = {}
+    if has_var_keyword or "teaching_state_context" in supported:
+        kwargs["teaching_state_context"] = teaching_state_context
+    if has_var_keyword or "learning_memory_context" in supported:
+        kwargs["learning_memory_context"] = learning_memory_context
+    if has_var_keyword or "conversation_history" in supported:
+        kwargs["conversation_history"] = conversation_history
+    return analyze_func(question, **kwargs)
+
+
+def _call_analyzer_model(
+    question: str,
+    *,
+    teaching_state_context: str | None = None,
+    learning_memory_context: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> str:
     api_key, base_url, model = load_qwen_config()
     client = OpenAI(api_key=api_key, base_url=base_url)
+    messages = build_conversation_messages(
+        QUESTION_ANALYZER_SYSTEM_PROMPT,
+        question,
+        teaching_state_context=teaching_state_context,
+        learning_memory_context=learning_memory_context,
+        conversation_history=conversation_history,
+    )
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": QUESTION_ANALYZER_SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
+        messages=messages,
     )
     content = response.choices[0].message.content
     if not content:
@@ -50,10 +100,17 @@ def _call_analyzer_model(question: str) -> str:
 def analyze_question(
     question: str,
     analyze_func: AnalyzeFunc | None = None,
+    *,
+    teaching_state_context: str | None = None,
+    learning_memory_context: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> tuple[QuestionAnalysis, bool]:
     analysis, analysis_fallback, _ = analyze_question_with_trace(
         question,
         analyze_func=analyze_func,
+        teaching_state_context=teaching_state_context,
+        learning_memory_context=learning_memory_context,
+        conversation_history=conversation_history,
     )
     return analysis, analysis_fallback
 
@@ -62,8 +119,15 @@ def analyze_question_with_trace(
     question: str,
     analyze_func: AnalyzeFunc | None = None,
     should_retry: ShouldRetryFunc | None = None,
+    *,
+    teaching_state_context: str | None = None,
+    learning_memory_context: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> tuple[QuestionAnalysis, bool, StepTrace]:
-    """分析问题，并返回与本次 Analyzer 执行对应的步骤记录。"""
+    """分析问题，并返回与本次 Analyzer 执行对应的步骤记录。
+
+    可选注入教学状态与最近历史，让跟进问题在路由阶段也能正确判断。
+    """
     if not isinstance(question, str) or not question.strip():
         raise ValueError("问题不能为空，请提供一道初中物理问题。")
 
@@ -72,10 +136,17 @@ def analyze_question_with_trace(
     retry_predicate = should_retry if should_retry is not None else lambda error: True
 
     def call_model() -> str:
-        return (
-            analyze_func(normalized_question)
-            if analyze_func is not None
-            else _call_analyzer_model(normalized_question)
+        return _invoke_analyze_func(
+            analyze_func,
+            normalized_question,
+            teaching_state_context=teaching_state_context,
+            learning_memory_context=learning_memory_context,
+            conversation_history=conversation_history,
+        ) if analyze_func is not None else _call_analyzer_model(
+            normalized_question,
+            teaching_state_context=teaching_state_context,
+            learning_memory_context=learning_memory_context,
+            conversation_history=conversation_history,
         )
 
     outcome = run_with_one_retry(

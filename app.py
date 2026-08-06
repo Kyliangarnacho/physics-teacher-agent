@@ -2,7 +2,32 @@
 
 import streamlit as st
 
-from src import agent as agent_module
+from src.conversation import (
+    ConversationServiceError,
+    StoredMessage,
+    build_recent_history,
+    run_conversation_turn,
+)
+from src.memory import (
+    MemoryCandidate,
+    MemoryServiceError,
+    confirm_memory_candidate,
+    extract_memory_candidates,
+)
+from src.storage import (
+    clear_conversation_contents,
+    create_conversation,
+    deactivate_memory,
+    delete_conversation,
+    delete_memory,
+    get_agent_runs,
+    get_conversation,
+    initialize_database,
+    list_conversations,
+    list_memories,
+    list_messages,
+    rename_conversation,
+)
 from src.ui.paste_images import decode_pasted_images
 from src.vision.batch import (
     build_batch_image_context,
@@ -13,15 +38,6 @@ from src.vision.batch import (
 )
 from src.vision.context import build_image_context_draft
 
-
-MODEL_ERROR_MESSAGES = {
-    "认证失败：请检查 DASHSCOPE_API_KEY 是否正确。",
-    "网络连接失败：请检查网络或 QWEN_BASE_URL。",
-    "请求过于频繁：请稍后再试。",
-    "千问 API 请求失败，请稍后再试。",
-    "调用千问时发生未知错误，请稍后再试。",
-    "千问返回了空回答。",
-}
 
 TEACHING_MODE_OPTIONS = {
     "auto": "自动判断",
@@ -42,6 +58,22 @@ VISION_MODE_OPTIONS = {
     "vision": "仅综合视觉",
     "ocr_enhanced": "OCR 增强",
 }
+
+MEMORY_TYPE_LABELS = {
+    "weakness": "薄弱点",
+    "misconception": "错误观念",
+    "preference": "讲解偏好",
+}
+
+MEMORY_SYSTEM_ERROR_PREFIXES = (
+    "工具参数校验失败",
+    "网络连接失败",
+    "请求过于频繁",
+    "千问 API 请求失败",
+    "调用千问时发生未知错误",
+    "千问返回了空回答",
+    "请补充题图",
+)
 
 PASTE_BRIDGE_KEY = "paste_image_bridge"
 DEFAULT_IMAGE_QUESTION = "请分析并解答这些图片中的物理问题。"
@@ -222,9 +254,12 @@ section[data-testid="stSidebar"] {
 """
 
 
-def clear_conversation() -> None:
-    """Clear chat plus unsent image work, without deleting the safe cache."""
-    st.session_state.messages = []
+STORAGE_INIT_KEY = "storage_initialized"
+CONVERSATION_CACHE_KEY = "conversation_cache"
+
+
+def clear_pending_image_state() -> None:
+    """清除未发送图片、待确认状态和粘贴桥，不影响 SQLite 中的消息。"""
     for key in (
         "pending_chat_submission",
         "pending_submission",
@@ -237,6 +272,281 @@ def clear_conversation() -> None:
     st.session_state.paste_bridge_reset_token = (
         int(st.session_state.get("paste_bridge_reset_token", 0)) + 1
     )
+
+
+def initialize_storage() -> bool:
+    """初始化 SQLite；失败时显示安全错误，不泄露路径、SQL 或密钥。"""
+    try:
+        initialize_database()
+        st.session_state[STORAGE_INIT_KEY] = True
+        return True
+    except Exception:
+        st.error("本地存储初始化失败，请稍后重试。")
+        return False
+
+
+def refresh_conversation_cache() -> None:
+    st.session_state[CONVERSATION_CACHE_KEY] = list_conversations()
+
+
+def get_conversation_cache() -> list[dict[str, object]]:
+    return st.session_state.get(CONVERSATION_CACHE_KEY) or []
+
+
+def ensure_current_conversation() -> str:
+    """没有会话或当前会话已被删除时，自动创建/恢复“新对话”。"""
+    current = st.session_state.get("current_conversation_id")
+    if current is not None and get_conversation(current) is not None:
+        return current
+    conversation = create_conversation("新对话")
+    st.session_state.current_conversation_id = conversation["id"]
+    refresh_conversation_cache()
+    return conversation["id"]
+
+
+def select_conversation(conversation_id: str) -> None:
+    """切换会话并清理跨会话的临时图片状态。"""
+    if conversation_id == st.session_state.get("current_conversation_id"):
+        return
+    _purge_memory_candidates_for_conversation(
+        st.session_state.get("current_conversation_id")
+    )
+    st.session_state.current_conversation_id = conversation_id
+    clear_pending_image_state()
+    st.rerun()
+
+
+def create_new_conversation() -> None:
+    _purge_memory_candidates_for_conversation(
+        st.session_state.get("current_conversation_id")
+    )
+    conversation = create_conversation("新对话")
+    st.session_state.current_conversation_id = conversation["id"]
+    clear_pending_image_state()
+    refresh_conversation_cache()
+    st.rerun()
+
+
+def rename_conversation_from_sidebar(conversation_id: str, title: str) -> None:
+    title = str(title).strip()
+    if title:
+        rename_conversation(conversation_id, title)
+        refresh_conversation_cache()
+        st.rerun()
+
+
+def delete_conversation_from_sidebar(conversation_id: str) -> None:
+    """删除会话；若删除的是当前会话，自动选择剩余最近会话或新建。"""
+    _purge_memory_candidates_for_conversation(conversation_id)
+    delete_conversation(conversation_id)
+    if conversation_id == st.session_state.get("current_conversation_id"):
+        remaining = list_conversations()
+        if remaining:
+            st.session_state.current_conversation_id = remaining[0]["id"]
+        else:
+            conversation = create_conversation("新对话")
+            st.session_state.current_conversation_id = conversation["id"]
+    clear_pending_image_state()
+    refresh_conversation_cache()
+    st.rerun()
+
+
+def clear_current_conversation() -> None:
+    """清空当前会话的消息、运行与状态，但保留会话本身。"""
+    _purge_memory_candidates_for_conversation(
+        st.session_state.current_conversation_id
+    )
+    clear_conversation_contents(st.session_state.current_conversation_id)
+    clear_pending_image_state()
+    refresh_conversation_cache()
+    st.rerun()
+
+
+def _memory_candidate_key(
+    conversation_id: str,
+    assistant_message_id: str,
+) -> str:
+    return f"{conversation_id}:{assistant_message_id}"
+
+
+def _purge_memory_candidates_for_conversation(conversation_id) -> None:
+    """清理属于某会话的临时候选，避免泄漏到其他会话。"""
+    candidates = st.session_state.get("memory_candidates")
+    if not candidates or not conversation_id:
+        return
+    prefix = f"{conversation_id}:"
+    for key in [key for key in candidates if str(key).startswith(prefix)]:
+        candidates.pop(key, None)
+
+
+def _safe_memory_history(conversation_id: str) -> list[dict[str, str]]:
+    """最近完整轮次（去掉本轮），只含 role/content，无图片与工具内部数据。"""
+    messages = list_messages(conversation_id)
+    prior = messages[:-2] if len(messages) >= 2 else []
+    stored = [StoredMessage.model_validate(item) for item in prior]
+    return build_recent_history(stored, max_turns=3)
+
+
+def _run_memory_analysis(
+    candidate_key: str,
+    conversation_id: str,
+    user_message_id: str,
+    user_model_content: str,
+    assistant_display_content: str,
+) -> None:
+    """点击“分析本轮学习表现”后提取候选并暂存 session_state，不写数据库。"""
+    history = _safe_memory_history(conversation_id)
+    try:
+        candidates = extract_memory_candidates(
+            user_model_content,
+            assistant_display_content,
+            conversation_history=history,
+        )
+    except Exception:
+        st.session_state.setdefault("memory_candidates", {})[candidate_key] = {
+            "conversation_id": conversation_id,
+            "user_message_id": user_message_id,
+            "status": "error",
+            "error": "记忆分析失败，请稍后重试。",
+            "candidates": [],
+            "statuses": [],
+        }
+        return
+    st.session_state.setdefault("memory_candidates", {})[candidate_key] = {
+        "conversation_id": conversation_id,
+        "user_message_id": user_message_id,
+        "status": "done",
+        "error": None,
+        "candidates": [candidate.model_dump() for candidate in candidates],
+        "statuses": ["pending"] * len(candidates),
+    }
+
+
+def _confirm_memory_candidate(candidate_key: str, index: int) -> None:
+    """确认保存候选；确认后才写入 learning_memories，重复确认走去重合并。"""
+    entry = st.session_state.get("memory_candidates", {}).get(candidate_key)
+    if not entry or entry.get("status") != "done":
+        return
+    candidates = entry.get("candidates") or []
+    if index >= len(candidates):
+        return
+    try:
+        candidate = MemoryCandidate.model_validate(dict(candidates[index]))
+        confirm_memory_candidate(
+            candidate,
+            source_conversation_id=entry.get("conversation_id"),
+            source_message_id=entry.get("user_message_id"),
+        )
+    except MemoryServiceError:
+        entry["error"] = "记忆保存失败，请稍后重试。"
+        return
+    statuses = list(entry.get("statuses") or [])
+    while len(statuses) <= index:
+        statuses.append("pending")
+    statuses[index] = "confirmed"
+    entry["statuses"] = statuses
+
+
+def _ignore_memory_candidate(candidate_key: str, index: int) -> None:
+    """忽略候选：只删除当前临时候选，不写数据库。"""
+    entry = st.session_state.get("memory_candidates", {}).get(candidate_key)
+    if not entry:
+        return
+    statuses = list(entry.get("statuses") or [])
+    while len(statuses) <= index:
+        statuses.append("pending")
+    statuses[index] = "ignored"
+    entry["statuses"] = statuses
+
+
+def _assistant_can_analyze(
+    run: dict[str, object],
+    content: str,
+) -> bool:
+    """只有存在对应 user、assistant 与 completed agent_run 时才可分析。"""
+    if not run:
+        return False
+    if str(run.get("status", "")) not in ("completed", "completed_with_fallback"):
+        return False
+    tool_records = run.get("tool_records_json") or []
+    if any(
+        isinstance(record, dict) and record.get("status") == "error"
+        for record in tool_records
+    ):
+        return False
+    return not content.startswith(MEMORY_SYSTEM_ERROR_PREFIXES)
+
+
+def render_memory_analysis(message: dict[str, object]) -> None:
+    """在成功的 assistant 回答下方提供“分析本轮学习表现”。"""
+    conversation_id = message.get("_conversation_id")
+    assistant_message_id = message.get("_assistant_message_id")
+    if not conversation_id or not assistant_message_id:
+        return
+    if not message.get("_can_analyze"):
+        return
+    user_model_content = message.get("_user_model_content")
+    user_message_id = message.get("_user_message_id")
+    if not user_model_content or not user_message_id:
+        return
+
+    candidate_key = _memory_candidate_key(conversation_id, assistant_message_id)
+    if st.button(
+        "分析本轮学习表现",
+        key=f"analyze_memory_{assistant_message_id}",
+    ):
+        _run_memory_analysis(
+            candidate_key,
+            conversation_id,
+            user_message_id,
+            user_model_content,
+            str(message.get("content", "")),
+        )
+        st.rerun()
+
+    entry = st.session_state.get("memory_candidates", {}).get(candidate_key)
+    if not entry:
+        return
+    if entry.get("error"):
+        st.error(entry["error"])
+        return
+    candidates = entry.get("candidates") or []
+    statuses = entry.get("statuses") or []
+    if not candidates:
+        st.caption("本轮没有提取到可确认的长期记忆。")
+        return
+    for index, candidate in enumerate(candidates):
+        memory_type = str(candidate.get("memory_type", ""))
+        label = MEMORY_TYPE_LABELS.get(memory_type, memory_type)
+        status = statuses[index] if index < len(statuses) else "pending"
+        st.markdown(
+            f"**{label}** · {candidate.get('topic', '')}  \n"
+            f"{candidate.get('content', '')}  \n"
+            f"置信度：{candidate.get('confidence', 0)} · "
+            f"依据：{candidate.get('evidence_summary', '')}"
+        )
+        if status == "pending":
+            confirm_col, ignore_col = st.columns(2)
+            with confirm_col:
+                if st.button(
+                    "确认保存",
+                    key=f"confirm_memory_{assistant_message_id}_{index}",
+                    width="stretch",
+                ):
+                    _confirm_memory_candidate(candidate_key, index)
+                    st.rerun()
+            with ignore_col:
+                if st.button(
+                    "忽略",
+                    key=f"ignore_memory_{assistant_message_id}_{index}",
+                    width="stretch",
+                ):
+                    _ignore_memory_candidate(candidate_key, index)
+                    st.rerun()
+        elif status == "confirmed":
+            st.caption("已保存")
+        elif status == "ignored":
+            st.caption("已忽略")
 
 
 def queue_chat_submission(input_key: str) -> None:
@@ -353,8 +663,12 @@ def render_agent_decision(message: dict[str, object]) -> None:
     """以简洁字段展示一次 Agent 的分析与路由决策。"""
     analysis = message.get("analysis")
     route = message.get("route")
-    if not isinstance(analysis, dict) or not isinstance(route, dict):
+    if not isinstance(analysis, dict) and not isinstance(route, dict):
         return
+    if not isinstance(analysis, dict):
+        analysis = {}
+    if not isinstance(route, dict):
+        route = {}
 
     teaching_mode = str(route.get("teaching_mode", ""))
     mode_label = TEACHING_MODE_OPTIONS.get(
@@ -524,6 +838,88 @@ def render_chat_message(message: dict[str, object], message_index: int) -> None:
                 render_agent_decision(message)
                 render_tool_records(message)
                 render_run_trace(message)
+                render_memory_analysis(message)
+
+
+def _assistant_render_dict(
+    message: dict[str, object],
+    run_by_assistant_id: dict[str, dict[str, object]],
+    *,
+    user_context: dict[str, object] | None = None,
+    can_analyze: bool = False,
+) -> dict[str, object]:
+    """从消息与对应 agent_run 还原 assistant 的页面展示详情。"""
+    run = run_by_assistant_id.get(str(message.get("id", ""))) or {}
+    trace = run.get("trace_json")
+    if not isinstance(trace, dict):
+        trace = {}
+    display_trace = trace if trace else None
+    return {
+        "role": "assistant",
+        "content": message.get("display_content") or "",
+        "sources": run.get("sources_json") or [],
+        "analysis": None,
+        "route": {
+            "teaching_mode": run.get("teaching_mode"),
+            "use_rag": bool(run.get("use_rag")),
+            "use_tools": bool(run.get("use_tools")),
+            "should_answer": True,
+        },
+        "analysis_fallback": bool(trace.get("analysis_fallback", False)),
+        "tool_records": run.get("tool_records_json") or [],
+        "tool_model_requests": int(trace.get("total_model_requests", 0) or 0),
+        "trace": display_trace,
+        "_conversation_id": message.get("conversation_id"),
+        "_assistant_message_id": message.get("id"),
+        "_user_message_id": (
+            user_context.get("id") if user_context else None
+        ),
+        "_user_model_content": (
+            user_context.get("model_content") if user_context else None
+        ),
+        "_can_analyze": can_analyze,
+    }
+
+
+def _user_render_dict(message: dict[str, object]) -> dict[str, object]:
+    return {
+        "role": "user",
+        "content": message.get("display_content") or "",
+    }
+
+
+def load_render_messages(
+    conversation_id: str,
+) -> list[dict[str, object]]:
+    """从 SQLite 读取消息，并用 agent_run 的 JSON 字段还原 assistant 详情。"""
+    messages = list_messages(conversation_id)
+    runs = get_agent_runs(conversation_id)
+    run_by_assistant_id = {
+        str(run["assistant_message_id"]): run
+        for run in runs
+        if run.get("assistant_message_id")
+    }
+    rendered: list[dict[str, object]] = []
+    last_user: dict[str, object] | None = None
+    for message in messages:
+        if message.get("role") == "assistant":
+            run = run_by_assistant_id.get(str(message.get("id", ""))) or {}
+            can_analyze = _assistant_can_analyze(
+                run,
+                str(message.get("display_content", "")),
+            )
+            rendered.append(
+                _assistant_render_dict(
+                    message,
+                    run_by_assistant_id,
+                    user_context=last_user,
+                    can_analyze=can_analyze,
+                )
+            )
+        else:
+            last_user = message
+            rendered.append(_user_render_dict(message))
+    return rendered
 
 
 def _image_history_metadata(
@@ -676,6 +1072,10 @@ def render_pending_confirmation() -> dict[str, object] | None:
                 images,
                 context_overrides=overrides,
             ),
+            "image_metadata": _image_history_metadata(
+                batch,
+                context_used=True,
+            ),
         }
     return None
 
@@ -687,9 +1087,18 @@ st.set_page_config(
     initial_sidebar_state="auto",
 )
 st.html(APP_STYLES)
-st.session_state.setdefault("messages", [])
 st.session_state.setdefault("vision_batch_cache", {})
 st.session_state.setdefault("paste_bridge_reset_token", 0)
+st.session_state.setdefault("memory_candidates", {})
+
+if not st.session_state.get(STORAGE_INIT_KEY):
+    if not initialize_storage():
+        st.stop()
+
+current_conversation_id = ensure_current_conversation()
+refresh_conversation_cache()
+render_messages = load_render_messages(current_conversation_id)
+
 queued_submission = st.session_state.pop("pending_chat_submission", None)
 submission_to_process = None
 submission_error = None
@@ -716,22 +1125,6 @@ if isinstance(queued_submission, dict):
                 "question": normalized_question,
                 "images": queued_images,
             }
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "content": normalized_question,
-                    "image_count": len(queued_images),
-                    "image_filenames": [
-                        str(item["filename"]) for item in queued_images
-                    ],
-                    "image_hash": [
-                        str(item["raw_hash"]) for item in queued_images
-                    ],
-                    "batch_id": None,
-                    "image_context_used": False,
-                    "vision_run_id": [],
-                }
-            )
 
 with st.sidebar:
     st.markdown("**初中物理教师**")
@@ -740,17 +1133,55 @@ with st.sidebar:
         "本地知识库辅助与本地确定性计算工具。"
     )
     st.button(
-        "清空当前对话",
+        "清空当前会话",
         key="clear_conversation",
         icon=":material/edit_square:",
         width="stretch",
-        on_click=clear_conversation,
+        on_click=clear_current_conversation,
     )
+
+    st.markdown("##### 会话")
+    if st.button(
+        "新建对话",
+        key="new_conversation",
+        icon=":material/add:",
+        width="stretch",
+    ):
+        create_new_conversation()
+    for conversation in get_conversation_cache():
+        cid = str(conversation.get("id", ""))
+        is_current = cid == current_conversation_id
+        with st.container(key=f"conversation_item_{cid}"):
+            st.markdown(
+                f"{':material/chat:' if is_current else ':material/chat_bubble_outline:'} "
+                f"{conversation.get('title', '新对话')}"
+                + ("　· 当前" if is_current else "")
+            )
+            select_col, rename_col, delete_col = st.columns([2, 1, 1])
+            with select_col:
+                if st.button("打开", key=f"select_conv_{cid}", width="content"):
+                    select_conversation(cid)
+            with rename_col:
+                if st.button("重命名", key=f"rename_btn_{cid}", width="content"):
+                    rename_conversation_from_sidebar(
+                        cid,
+                        st.session_state.get(f"rename_input_{cid}", ""),
+                    )
+            with delete_col:
+                if st.button("删除", key=f"delete_conv_{cid}", width="content"):
+                    delete_conversation_from_sidebar(cid)
+            st.text_input(
+                "会话标题",
+                value=str(conversation.get("title", "")),
+                key=f"rename_input_{cid}",
+                label_visibility="collapsed",
+            )
+    st.divider()
 
     st.markdown("##### 当前对话")
     user_message_previews = [
         str(message.get("content", "")).strip()
-        for message in st.session_state.messages
+        for message in render_messages
         if message.get("role") == "user"
     ]
     if user_message_previews:
@@ -801,8 +1232,46 @@ with st.sidebar:
     )
     st.caption("在聊天框粘贴或选择图片，发送后才会开始识别。")
 
+    st.divider()
+    st.markdown("##### 学习档案")
+    memories = [
+        memory
+        for memory in list_memories()
+        if memory.get("confirmed") == 1
+    ]
+    if memories:
+        for memory in memories:
+            memory_id = str(memory.get("id", ""))
+            memory_type = str(memory.get("memory_type", ""))
+            label = MEMORY_TYPE_LABELS.get(memory_type, memory_type)
+            with st.container(key=f"memory_item_{memory_id}"):
+                st.markdown(
+                    f"**{label}** · {memory.get('topic', '')}  \n"
+                    f"{memory.get('content', '')}  \n"
+                    f"证据次数：{memory.get('evidence_count', 0)}"
+                )
+                action_col, delete_col = st.columns(2)
+                with action_col:
+                    if st.button(
+                        "停用",
+                        key=f"memory_deactivate_{memory_id}",
+                        width="content",
+                    ):
+                        deactivate_memory(memory_id)
+                        st.rerun()
+                with delete_col:
+                    if st.button(
+                        "删除",
+                        key=f"memory_delete_{memory_id}",
+                        width="content",
+                    ):
+                        delete_memory(memory_id)
+                        st.rerun()
+    else:
+        st.caption("还没有已确认的长期记忆。")
+
 is_empty_state = (
-    not st.session_state.messages
+    not render_messages
     and submission_to_process is None
     and st.session_state.get("pending_submission") is None
 )
@@ -814,10 +1283,13 @@ if is_empty_state:
         if submission_error:
             st.warning(submission_error)
 else:
-    for message_index, message in enumerate(st.session_state.messages):
+    for message_index, message in enumerate(render_messages):
         render_chat_message(message, message_index)
 
     response_slot = st.empty()
+
+if st.session_state.get("last_turn_error"):
+    st.error(st.session_state["last_turn_error"])
 
 pending_agent_payload = None
 if st.session_state.get("pending_submission") is not None:
@@ -885,84 +1357,42 @@ if submission_to_process is not None:
                     "question": question,
                     "batch": batch,
                     "image_context": build_batch_image_context(batch_images),
+                    "image_metadata": _image_history_metadata(
+                        batch,
+                        context_used=True,
+                    ),
                 }
     else:
         agent_payload = {
             "question": question,
             "batch": None,
             "image_context": None,
+            "image_metadata": None,
         }
 
 if agent_payload is not None:
     question = str(agent_payload["question"])
-    batch = agent_payload.get("batch")
     image_context = agent_payload.get("image_context")
+    image_metadata = agent_payload.get("image_metadata")
+    st.session_state.pop("last_turn_error", None)
     try:
         with st.spinner("正在生成讲解……"):
-            if isinstance(image_context, str) and image_context.strip():
-                agent_result = agent_module.run_teacher_agent(
-                    question,
-                    mode_override=mode_override_for_question,
-                    rag_policy=rag_policy_for_question,
-                    image_context=image_context,
-                    image_context_available=True,
-                )
-            else:
-                agent_result = agent_module.run_teacher_agent(
-                    question,
-                    mode_override=mode_override_for_question,
-                    rag_policy=rag_policy_for_question,
-                )
-            answer = agent_result["answer"]
-    except Exception:
-        if response_slot is not None:
-            with response_slot.container():
-                st.error("回答生成失败，请稍后再试。")
-    else:
-        if answer in MODEL_ERROR_MESSAGES:
-            if response_slot is not None:
-                with response_slot.container():
-                    st.error(answer)
-        else:
-            metadata = _image_history_metadata(
-                batch if isinstance(batch, dict) else None,
-                context_used=isinstance(image_context, str),
+            run_conversation_turn(
+                current_conversation_id,
+                display_question=question,
+                model_question=question,
+                image_metadata=image_metadata,
+                confirmed_image_context=(
+                    image_context
+                    if isinstance(image_context, str) and image_context.strip()
+                    else None
+                ),
+                mode_override=mode_override_for_question,
+                rag_policy=rag_policy_for_question,
             )
-            assistant_message = {
-                "role": "assistant",
-                "content": answer,
-                "sources": agent_result.get("sources", []),
-                "analysis": agent_result.get("analysis", {}),
-                "route": agent_result.get("route", {}),
-                "analysis_fallback": agent_result.get(
-                    "analysis_fallback",
-                    False,
-                ),
-                "tool_records": agent_result.get("tool_records", []),
-                "tool_model_requests": agent_result.get(
-                    "tool_model_requests",
-                    0,
-                ),
-                "trace": agent_result.get("trace"),
-                **metadata,
-            }
-            if isinstance(batch, dict):
-                batch_metadata = _image_history_metadata(
-                    batch,
-                    context_used=True,
-                )
-                for message in reversed(st.session_state.messages):
-                    if (
-                        message.get("role") == "user"
-                        and message.get("batch_id") is None
-                    ):
-                        message.update(batch_metadata)
-                        break
-            st.session_state.messages.append(assistant_message)
-            _clear_pending_submission()
-            if response_slot is not None:
-                with response_slot.container():
-                    render_chat_message(
-                        assistant_message,
-                        len(st.session_state.messages) - 1,
-                    )
+    except ConversationServiceError:
+        st.session_state.last_turn_error = "回答生成失败，请稍后重试。"
+        st.rerun()
+    else:
+        _clear_pending_submission()
+        st.rerun()

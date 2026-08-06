@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from typing import Any
 
 from src.analyzer import analyze_question_with_trace
-from src.model_client import answer_question
+from src.model_client import answer_question, validate_conversation_history
 from src.observability import RunTraceBuilder, StepTimer, create_skipped_step
 from src.prompts import MODE_INSTRUCTIONS
 from src.rag import retrieve_rag_context
@@ -22,6 +23,51 @@ _RECOVERABLE_IMAGE_TOOL_ERRORS = {
 }
 
 _MULTI_IMAGE_SEPARATE_MARKERS = ("分别", "依次", "各自", "每张")
+
+
+def _invoke_with_context(
+    func: Callable[..., Any],
+    question: str,
+    *,
+    context: str | None,
+    mode_instruction: str | None,
+    teaching_state_context: str | None,
+    learning_memory_context: str | None,
+    conversation_history: list[dict[str, str]] | None,
+) -> Any:
+    """以兼容方式调用回答/工具函数。
+
+    支持新上下文的函数会收到 teaching_state_context / conversation_history；
+    旧签名（question/context/mode_instruction）的函数保持 Stage 09 原调用方式。
+    """
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(question, context=context, mode_instruction=mode_instruction)
+    parameters = signature.parameters
+    has_var_keyword = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    )
+    supported = {
+        name
+        for name, param in parameters.items()
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    kwargs: dict[str, object] = {}
+    if has_var_keyword or "teaching_state_context" in supported:
+        kwargs["teaching_state_context"] = teaching_state_context
+    if has_var_keyword or "learning_memory_context" in supported:
+        kwargs["learning_memory_context"] = learning_memory_context
+    if has_var_keyword or "conversation_history" in supported:
+        kwargs["conversation_history"] = conversation_history
+    return func(
+        question,
+        context=context,
+        mode_instruction=mode_instruction,
+        **kwargs,
+    )
 
 
 def _requires_multiple_independent_answers(
@@ -101,12 +147,32 @@ def run_teacher_agent(
     case_id: str | None = None,
     image_context: str | None = None,
     image_context_available: bool = False,
+    conversation_history: list[dict[str, str]] | None = None,
+    teaching_state_context: str | None = None,
+    learning_memory_context: str | None = None,
 ) -> dict[str, Any]:
-    """分析、路由并回答一道初中物理问题。"""
+    """分析、路由并回答一道初中物理问题。
+
+    conversation_history：最近的完整轮次（user/assistant），按旧到新传入，
+    会注入 Analyzer、普通最终回答与 Tool Client；传入结构不会被修改。
+    teaching_state_context：已确认的安全教学状态文本，只注入一次。
+    两者默认均为 None，保持 Stage 09 行为兼容。
+    """
     if not isinstance(question, str) or not question.strip():
         raise ValueError("问题不能为空，请提供一道初中物理问题。")
     if not isinstance(image_context_available, bool):
         raise ValueError("image_context_available 必须是布尔值。")
+    validate_conversation_history(conversation_history)
+    if teaching_state_context is not None and not isinstance(
+        teaching_state_context,
+        str,
+    ):
+        raise ValueError("teaching_state_context 必须是字符串。")
+    if learning_memory_context is not None and not isinstance(
+        learning_memory_context,
+        str,
+    ):
+        raise ValueError("learning_memory_context 必须是字符串。")
     if image_context_available and (
         not isinstance(image_context, str) or not image_context.strip()
     ):
@@ -123,6 +189,9 @@ def run_teacher_agent(
     analysis, analysis_fallback, analyzer_trace = analyze_question_with_trace(
         active_question,
         analyze_func=analyzer_func,
+        teaching_state_context=teaching_state_context,
+        learning_memory_context=learning_memory_context,
+        conversation_history=conversation_history,
     )
     trace_builder.add_step(analyzer_trace)
 
@@ -230,10 +299,14 @@ def run_teacher_agent(
             tool_model_requests = 0
             tool_fallback = True
             fallback_timer = StepTimer("final_answer")
-            answer = active_answer_func(
+            answer = _invoke_with_context(
+                active_answer_func,
                 active_question,
                 context=context,
                 mode_instruction=mode_instruction,
+                teaching_state_context=teaching_state_context,
+                learning_memory_context=learning_memory_context,
+                conversation_history=conversation_history,
             )
             trace_builder.add_step(
                 fallback_timer.finish(
@@ -252,10 +325,14 @@ def run_teacher_agent(
                 if tool_answer_func is not None
                 else answer_with_tools
             )
-            tool_result = active_tool_answer_func(
+            tool_result = _invoke_with_context(
+                active_tool_answer_func,
                 active_question,
                 context=context,
                 mode_instruction=mode_instruction,
+                teaching_state_context=teaching_state_context,
+                learning_memory_context=learning_memory_context,
+                conversation_history=conversation_history,
             )
             answer = tool_result["answer"]
             tool_records = tool_result["tool_records"]
@@ -268,10 +345,14 @@ def run_teacher_agent(
             )
             if tool_fallback:
                 fallback_timer = StepTimer("final_answer")
-                answer = active_answer_func(
+                answer = _invoke_with_context(
+                    active_answer_func,
                     active_question,
                     context=context,
                     mode_instruction=mode_instruction,
+                    teaching_state_context=teaching_state_context,
+                    learning_memory_context=learning_memory_context,
+                    conversation_history=conversation_history,
                 )
                 trace_builder.add_step(
                     fallback_timer.finish(
@@ -287,10 +368,14 @@ def run_teacher_agent(
     else:
         tool_fallback = False
         answer_timer = StepTimer("final_answer")
-        answer = active_answer_func(
+        answer = _invoke_with_context(
+            active_answer_func,
             active_question,
             context=context,
             mode_instruction=mode_instruction,
+            teaching_state_context=teaching_state_context,
+            learning_memory_context=learning_memory_context,
+            conversation_history=conversation_history,
         )
         tool_records = []
         tool_model_requests = 0

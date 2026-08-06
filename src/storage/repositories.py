@@ -1,0 +1,926 @@
+"""Stage 10 Repository 数据访问层。
+
+约定：
+- SQL 只集中在本文件，业务文件不直接接触 SQLite；
+- 每次调用使用短生命周期连接并显式提交/回滚，不保存全局连接；
+- 输入输出均为 Python dict/list；JSON 字段（*_json / image_metadata_json）
+  在内部自动序列化（``ensure_ascii=False``）与反序列化；
+- 新记录默认生成 UUID（``uuid4().hex``），时间使用带时区的 UTC ISO 8601 字符串；
+- 数据库异常统一包装为 RepositoryError，不暴露 SQL 语句或数据库绝对路径。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+from src.storage.database import DatabasePath, connect_database
+
+
+_CONVERSATION_COLUMNS = (
+    "id",
+    "title",
+    "created_at",
+    "updated_at",
+    "archived",
+)
+_MESSAGE_COLUMNS = (
+    "id",
+    "conversation_id",
+    "role",
+    "display_content",
+    "model_content",
+    "image_metadata_json",
+    "created_at",
+)
+_AGENT_RUN_COLUMNS = (
+    "run_id",
+    "conversation_id",
+    "user_message_id",
+    "assistant_message_id",
+    "status",
+    "teaching_mode",
+    "use_rag",
+    "use_tools",
+    "total_model_requests",
+    "total_duration_ms",
+    "sources_json",
+    "tool_records_json",
+    "trace_json",
+    "created_at",
+)
+_CONVERSATION_STATE_COLUMNS = (
+    "conversation_id",
+    "active_problem_text",
+    "active_image_context",
+    "teaching_mode",
+    "hint_step",
+    "updated_at",
+)
+_MEMORY_COLUMNS = (
+    "id",
+    "memory_type",
+    "topic",
+    "content",
+    "normalized_content",
+    "evidence_count",
+    "confidence",
+    "source_conversation_id",
+    "source_message_id",
+    "confirmed",
+    "active",
+    "created_at",
+    "updated_at",
+)
+_STATE_OPTIONAL_FIELDS = (
+    "active_problem_text",
+    "active_image_context",
+    "teaching_mode",
+    "hint_step",
+)
+
+
+class StorageError(Exception):
+    """存储层统一异常，不暴露 SQL 语句或数据库绝对路径。"""
+
+
+class RepositoryError(StorageError):
+    """数据访问层操作失败。"""
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_id() -> str:
+    return uuid4().hex
+
+
+def _json_dumps(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    raise ValueError("JSON 字段必须是 dict、list 或 JSON 字符串。")
+
+
+def _json_loads(value: str | None) -> Any:
+    if value is None or value == "":
+        return None
+    return json.loads(value)
+
+
+def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
+def _message_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_to_dict(row)
+    data["image_metadata_json"] = _json_loads(data["image_metadata_json"])
+    return data
+
+
+def _agent_run_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_to_dict(row)
+    for name in ("sources_json", "tool_records_json", "trace_json"):
+        data[name] = _json_loads(data[name])
+    return data
+
+
+@contextmanager
+def _connection(path: DatabasePath | None) -> Iterator[sqlite3.Connection]:
+    try:
+        conn = connect_database(path)
+    except OSError as exc:
+        raise RepositoryError("数据库连接失败：无法访问数据库文件。") from exc
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_conversation(
+    title: str = "新对话",
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """创建会话并返回完整记录；默认生成 UUID 与 UTC 时间。"""
+    if not isinstance(title, str):
+        raise RepositoryError("会话标题必须是字符串。")
+    conversation_id = _new_id()
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            conn.execute(
+                "INSERT INTO conversations "
+                "(id, title, created_at, updated_at, archived) "
+                "VALUES (?, ?, ?, ?, 0)",
+                (conversation_id, title, now, now),
+            )
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话创建失败：数据库错误。") from exc
+    return {
+        "id": conversation_id,
+        "title": title,
+        "created_at": now,
+        "updated_at": now,
+        "archived": 0,
+    }
+
+
+def list_conversations(
+    *,
+    include_archived: bool = False,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """按 updated_at 倒序列出会话；默认排除已归档会话。"""
+    query = (
+        "SELECT id, title, created_at, updated_at, archived "
+        "FROM conversations"
+    )
+    if not include_archived:
+        query += " WHERE archived = 0"
+    query += " ORDER BY updated_at DESC, created_at DESC, rowid DESC"
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(query).fetchall()
+            return [_row_to_dict(row) for row in rows]
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话列表读取失败：数据库错误。") from exc
+
+
+def get_conversation(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any] | None:
+    """按 ID 读取单个会话；不存在时返回 None。"""
+    try:
+        with _connection(path) as conn:
+            row = conn.execute(
+                "SELECT id, title, created_at, updated_at, archived "
+                "FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            return _row_to_dict(row)
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话读取失败：数据库错误。") from exc
+
+
+def rename_conversation(
+    conversation_id: str,
+    title: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """重命名会话并刷新 updated_at；会话不存在时抛出 RepositoryError。"""
+    if not isinstance(title, str):
+        raise RepositoryError("会话标题必须是字符串。")
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? "
+                "WHERE id = ?",
+                (title, now, conversation_id),
+            )
+            if cursor.rowcount == 0:
+                raise RepositoryError("会话不存在，无法重命名。")
+            row = conn.execute(
+                "SELECT id, title, created_at, updated_at, archived "
+                "FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            return _row_to_dict(row)
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话重命名失败：数据库错误。") from exc
+
+
+def delete_conversation(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> bool:
+    """删除会话；messages/agent_runs/conversation_states 由外键级联删除，
+    learning_memories 不受影响。返回是否删除成功。"""
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM conversations WHERE id = ?",
+                (conversation_id,),
+            )
+            return cursor.rowcount > 0
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话删除失败：数据库错误。") from exc
+
+
+def _prepare_message(
+    message: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """校验并规范化一条消息的插入值；不打开连接。"""
+    conversation_id = message.get("conversation_id")
+    role = message.get("role")
+    display_content = message.get("display_content")
+    model_content = message.get("model_content")
+    if (
+        not conversation_id
+        or role is None
+        or display_content is None
+        or model_content is None
+    ):
+        raise ValueError(
+            "消息缺少必要字段：conversation_id、role、display_content、model_content。"
+        )
+    try:
+        image_metadata_json = _json_dumps(message.get("image_metadata_json"))
+    except ValueError as exc:
+        raise ValueError("消息图片元数据必须是 dict、list 或 JSON 字符串。") from exc
+    return {
+        "message_id": message.get("id") or _new_id(),
+        "conversation_id": conversation_id,
+        "role": role,
+        "display_content": display_content,
+        "model_content": model_content,
+        "image_metadata_json": image_metadata_json,
+        "created_at": message.get("created_at") or now,
+    }
+
+
+def _insert_message_on_conn(
+    conn: sqlite3.Connection,
+    prepared: dict[str, Any],
+) -> None:
+    conn.execute(
+        "INSERT INTO messages "
+        "(id, conversation_id, role, display_content, model_content, "
+        "image_metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            prepared["message_id"],
+            prepared["conversation_id"],
+            prepared["role"],
+            prepared["display_content"],
+            prepared["model_content"],
+            prepared["image_metadata_json"],
+            prepared["created_at"],
+        ),
+    )
+    conn.execute(
+        "UPDATE conversations SET updated_at = ? WHERE id = ?",
+        (prepared["created_at"], prepared["conversation_id"]),
+    )
+
+
+def _prepare_agent_run(
+    run: dict[str, Any],
+    now: str,
+    *,
+    assistant_message_id: str | None = None,
+) -> dict[str, Any]:
+    """校验并规范化一次 AgentRun 的插入值；不打开连接。"""
+    conversation_id = run.get("conversation_id")
+    user_message_id = run.get("user_message_id")
+    status = run.get("status")
+    if not conversation_id or not user_message_id or not status:
+        raise ValueError(
+            "AgentRun 缺少必要字段：conversation_id、user_message_id、status。"
+        )
+    try:
+        sources_json = _json_dumps(run.get("sources_json"))
+        tool_records_json = _json_dumps(run.get("tool_records_json"))
+        trace_json = _json_dumps(run.get("trace_json"))
+    except ValueError as exc:
+        raise ValueError(
+            "AgentRun 的 JSON 字段必须是 dict、list 或 JSON 字符串。"
+        ) from exc
+    resolved_assistant_message_id = (
+        assistant_message_id
+        if assistant_message_id is not None
+        else run.get("assistant_message_id")
+    )
+    return {
+        "run_id": run.get("run_id") or _new_id(),
+        "conversation_id": conversation_id,
+        "user_message_id": user_message_id,
+        "assistant_message_id": resolved_assistant_message_id,
+        "status": status,
+        "teaching_mode": run.get("teaching_mode"),
+        "use_rag": int(bool(run.get("use_rag", False))),
+        "use_tools": int(bool(run.get("use_tools", False))),
+        "total_model_requests": int(run.get("total_model_requests", 0)),
+        "total_duration_ms": float(run.get("total_duration_ms", 0.0)),
+        "sources_json": sources_json,
+        "tool_records_json": tool_records_json,
+        "trace_json": trace_json,
+        "created_at": run.get("created_at") or now,
+    }
+
+
+def _insert_agent_run_on_conn(
+    conn: sqlite3.Connection,
+    prepared: dict[str, Any],
+) -> None:
+    conn.execute(
+        "INSERT INTO agent_runs "
+        "(run_id, conversation_id, user_message_id, assistant_message_id, "
+        "status, teaching_mode, use_rag, use_tools, total_model_requests, "
+        "total_duration_ms, sources_json, tool_records_json, trace_json, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            prepared["run_id"],
+            prepared["conversation_id"],
+            prepared["user_message_id"],
+            prepared["assistant_message_id"],
+            prepared["status"],
+            prepared["teaching_mode"],
+            prepared["use_rag"],
+            prepared["use_tools"],
+            prepared["total_model_requests"],
+            prepared["total_duration_ms"],
+            prepared["sources_json"],
+            prepared["tool_records_json"],
+            prepared["trace_json"],
+            prepared["created_at"],
+        ),
+    )
+
+
+def insert_message(
+    message: dict[str, Any],
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """插入一条消息并刷新所属会话的 updated_at；返回完整存储记录。"""
+    now = message.get("created_at") or _utc_now_iso()
+    try:
+        prepared = _prepare_message(message, now)
+    except ValueError as exc:
+        raise RepositoryError(str(exc)) from exc
+    try:
+        with _connection(path) as conn:
+            _insert_message_on_conn(conn, prepared)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("消息保存失败：会话不存在或字段不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("消息保存失败：数据库错误。") from exc
+    return {
+        "id": prepared["message_id"],
+        "conversation_id": prepared["conversation_id"],
+        "role": prepared["role"],
+        "display_content": prepared["display_content"],
+        "model_content": prepared["model_content"],
+        "image_metadata_json": message.get("image_metadata_json"),
+        "created_at": prepared["created_at"],
+    }
+
+
+def list_messages(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """按时间正序列出会话内全部消息，JSON 字段自动反序列化。"""
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT id, conversation_id, role, display_content, model_content, "
+                "image_metadata_json, created_at FROM messages "
+                "WHERE conversation_id = ? "
+                "ORDER BY created_at ASC, rowid ASC",
+                (conversation_id,),
+            ).fetchall()
+            return [_message_from_row(row) for row in rows]
+    except RepositoryError:
+        raise
+    except ValueError as exc:
+        raise RepositoryError("消息记录包含无法解析的 JSON。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("消息列表读取失败：数据库错误。") from exc
+
+
+def get_recent_messages(
+    conversation_id: str,
+    limit: int = 10,
+    *,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """返回最近 limit 条消息，返回顺序仍为从旧到新。"""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise RepositoryError("limit 必须是正整数。")
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT id, conversation_id, role, display_content, model_content, "
+                "image_metadata_json, created_at FROM ("
+                "  SELECT id, conversation_id, role, display_content, model_content, "
+                "  image_metadata_json, created_at, rowid AS _rowid FROM messages "
+                "  WHERE conversation_id = ? "
+                "  ORDER BY created_at DESC, rowid DESC LIMIT ?"
+                ") ORDER BY created_at ASC, _rowid ASC",
+                (conversation_id, limit),
+            ).fetchall()
+            return [_message_from_row(row) for row in rows]
+    except RepositoryError:
+        raise
+    except ValueError as exc:
+        raise RepositoryError("消息记录包含无法解析的 JSON。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("最近消息读取失败：数据库错误。") from exc
+
+
+def insert_agent_run(
+    run: dict[str, Any],
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """插入一次 AgentRun；JSON 字段自动序列化，返回完整存储记录。"""
+    now = run.get("created_at") or _utc_now_iso()
+    try:
+        prepared = _prepare_agent_run(run, now)
+    except ValueError as exc:
+        raise RepositoryError(str(exc)) from exc
+    try:
+        with _connection(path) as conn:
+            _insert_agent_run_on_conn(conn, prepared)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("AgentRun 保存失败：会话不存在或字段不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("AgentRun 保存失败：数据库错误。") from exc
+    return {
+        "run_id": prepared["run_id"],
+        "conversation_id": prepared["conversation_id"],
+        "user_message_id": prepared["user_message_id"],
+        "assistant_message_id": prepared["assistant_message_id"],
+        "status": prepared["status"],
+        "teaching_mode": prepared["teaching_mode"],
+        "use_rag": prepared["use_rag"],
+        "use_tools": prepared["use_tools"],
+        "total_model_requests": prepared["total_model_requests"],
+        "total_duration_ms": prepared["total_duration_ms"],
+        "sources_json": run.get("sources_json"),
+        "tool_records_json": run.get("tool_records_json"),
+        "trace_json": run.get("trace_json"),
+        "created_at": prepared["created_at"],
+    }
+
+
+def get_agent_runs(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """按时间正序列出会话内 AgentRun，JSON 字段自动反序列化。"""
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT run_id, conversation_id, user_message_id, assistant_message_id, "
+                "status, teaching_mode, use_rag, use_tools, total_model_requests, "
+                "total_duration_ms, sources_json, tool_records_json, trace_json, "
+                "created_at FROM agent_runs "
+                "WHERE conversation_id = ? "
+                "ORDER BY created_at ASC, rowid ASC",
+                (conversation_id,),
+            ).fetchall()
+            return [_agent_run_from_row(row) for row in rows]
+    except RepositoryError:
+        raise
+    except ValueError as exc:
+        raise RepositoryError("AgentRun 记录包含无法解析的 JSON。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("AgentRun 列表读取失败：数据库错误。") from exc
+
+
+def get_conversation_state(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any] | None:
+    """读取会话状态；不存在时返回 None。"""
+    try:
+        with _connection(path) as conn:
+            row = conn.execute(
+                "SELECT conversation_id, active_problem_text, active_image_context, "
+                "teaching_mode, hint_step, updated_at "
+                "FROM conversation_states WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            return _row_to_dict(row)
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话状态读取失败：数据库错误。") from exc
+
+
+def _state_upsert_sql(
+    state: dict[str, Any],
+    now: str,
+) -> tuple[str, tuple[Any, ...]]:
+    """构造 conversation_states 的 upsert SQL 与参数；不打开连接。"""
+    conversation_id = state.get("conversation_id")
+    if not conversation_id:
+        raise ValueError("会话状态缺少 conversation_id。")
+    provided = [name for name in _STATE_OPTIONAL_FIELDS if name in state]
+    if provided:
+        columns = ", ".join(provided)
+        placeholders = ", ".join("?" for _ in provided)
+        updates = ", ".join(f"{name} = excluded.{name}" for name in provided)
+        sql = (
+            "INSERT INTO conversation_states "
+            f"(conversation_id, {columns}, updated_at) VALUES (?, {placeholders}, ?) "
+            f"ON CONFLICT(conversation_id) DO UPDATE SET "
+            f"{updates}, updated_at = excluded.updated_at"
+        )
+        params = (conversation_id, *(state[name] for name in provided), now)
+    else:
+        sql = (
+            "INSERT INTO conversation_states (conversation_id, updated_at) "
+            "VALUES (?, ?) ON CONFLICT(conversation_id) DO UPDATE SET "
+            "updated_at = excluded.updated_at"
+        )
+        params = (conversation_id, now)
+    return sql, params
+
+
+def upsert_conversation_state(
+    state: dict[str, Any],
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """新增或按 conversation_id 冲突更新会话状态。
+
+    只更新输入中出现的可选字段，未提供的字段保持不变；始终刷新 updated_at。
+    """
+    conversation_id = state.get("conversation_id")
+    if not conversation_id:
+        raise RepositoryError("会话状态缺少 conversation_id。")
+    now = state.get("updated_at") or _utc_now_iso()
+    try:
+        insert_sql, params = _state_upsert_sql(state, now)
+    except ValueError as exc:
+        raise RepositoryError(str(exc)) from exc
+    try:
+        with _connection(path) as conn:
+            conn.execute(insert_sql, params)
+            row = conn.execute(
+                "SELECT conversation_id, active_problem_text, active_image_context, "
+                "teaching_mode, hint_step, updated_at "
+                "FROM conversation_states WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            return _row_to_dict(row)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("会话状态保存失败：会话不存在或字段不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话状态保存失败：数据库错误。") from exc
+
+
+def finalize_conversation_turn(
+    conversation_id: str,
+    assistant_message: dict[str, Any],
+    agent_run: dict[str, Any],
+    conversation_state: dict[str, Any] | None = None,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """在一个短事务内原子保存 assistant 消息、agent_run 与可选状态更新。
+
+    assistant 消息、agent_run 与 conversation_state 要么全部成功，要么全部
+    回滚；user 消息由调用方在事务外先保存。
+    """
+    now = _utc_now_iso()
+    try:
+        assistant = _prepare_message(assistant_message, now)
+        if assistant["conversation_id"] != conversation_id:
+            raise ValueError("assistant_message 的 conversation_id 与传入会话不一致。")
+        run = _prepare_agent_run(
+            agent_run,
+            now,
+            assistant_message_id=assistant["message_id"],
+        )
+        if run["conversation_id"] != conversation_id:
+            raise ValueError("agent_run 的 conversation_id 与传入会话不一致。")
+        state_sql: str | None = None
+        state_params: tuple[Any, ...] | None = None
+        if conversation_state is not None:
+            normalized_state = dict(conversation_state)
+            normalized_state["conversation_id"] = conversation_id
+            state_sql, state_params = _state_upsert_sql(normalized_state, now)
+    except ValueError as exc:
+        raise RepositoryError(str(exc)) from exc
+
+    try:
+        with _connection(path) as conn:
+            _insert_message_on_conn(conn, assistant)
+            _insert_agent_run_on_conn(conn, run)
+            if state_sql is not None:
+                conn.execute(state_sql, state_params)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("会话轮次保存失败：会话不存在或字段不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话轮次保存失败：数据库错误。") from exc
+
+    return {
+        "conversation_id": conversation_id,
+        "user_message_id": run["user_message_id"],
+        "assistant_message_id": assistant["message_id"],
+        "agent_run_id": run["run_id"],
+    }
+
+
+def clear_conversation_contents(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> bool:
+    """在一个事务内清空会话的消息、agent_runs 与状态，但保留 conversation 行。
+
+    返回会话是否存在；不存在时不做任何删除并返回 False。
+    """
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, conversation_id),
+            )
+            if cursor.rowcount == 0:
+                return False
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM agent_runs WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM conversation_states WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            return True
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话内容清空失败：数据库错误。") from exc
+
+
+def reset_conversation_state(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> bool:
+    """删除会话当前状态；返回是否删除成功。"""
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM conversation_states WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            return cursor.rowcount > 0
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话状态重置失败：数据库错误。") from exc
+
+
+def insert_or_merge_memory(
+    memory: dict[str, Any],
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """按 memory_type + topic + normalized_content 插入或合并记忆。
+
+    首次插入生成新 id；重复合并时保留原 id，evidence_count 加 1，并更新内容、
+    置信度、来源、状态和 updated_at（created_at 保持不变）。
+    """
+    missing = [
+        name
+        for name in ("memory_type", "topic", "content", "normalized_content", "confidence")
+        if name not in memory
+    ]
+    if missing:
+        raise RepositoryError(f"记忆缺少必要字段：{', '.join(missing)}。")
+    memory_id = memory.get("id") or _new_id()
+    created_at = memory.get("created_at") or _utc_now_iso()
+    now = memory.get("updated_at") or _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO learning_memories "
+                    "(id, memory_type, topic, content, normalized_content, "
+                    "evidence_count, confidence, source_conversation_id, "
+                    "source_message_id, confirmed, active, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        memory_id,
+                        memory["memory_type"],
+                        memory["topic"],
+                        memory["content"],
+                        memory["normalized_content"],
+                        int(memory.get("evidence_count", 1)),
+                        float(memory["confidence"]),
+                        memory.get("source_conversation_id"),
+                        memory.get("source_message_id"),
+                        int(memory.get("confirmed", 1)),
+                        int(memory.get("active", 1)),
+                        created_at,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute(
+                    "SELECT id FROM learning_memories "
+                    "WHERE memory_type = ? AND topic = ? AND normalized_content = ?",
+                    (memory["memory_type"], memory["topic"], memory["normalized_content"]),
+                ).fetchone()
+                if existing is None:
+                    raise
+                memory_id = existing["id"]
+                conn.execute(
+                    "UPDATE learning_memories "
+                    "SET content = ?, evidence_count = evidence_count + 1, "
+                    "confidence = ?, source_conversation_id = ?, "
+                    "source_message_id = ?, confirmed = ?, active = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (
+                        memory["content"],
+                        float(memory["confidence"]),
+                        memory.get("source_conversation_id"),
+                        memory.get("source_message_id"),
+                        int(memory.get("confirmed", 1)),
+                        int(memory.get("active", 1)),
+                        now,
+                        memory_id,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT id, memory_type, topic, content, normalized_content, "
+                "evidence_count, confidence, source_conversation_id, "
+                "source_message_id, confirmed, active, created_at, updated_at "
+                "FROM learning_memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            return _row_to_dict(row)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("记忆保存失败：id 冲突或数据不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("记忆保存失败：数据库错误。") from exc
+
+
+def list_memories(
+    *,
+    memory_type: str | None = None,
+    topic: str | None = None,
+    include_inactive: bool = False,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """列出记忆；默认只返回 active=1，按 updated_at 倒序。"""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if memory_type is not None:
+        conditions.append("memory_type = ?")
+        params.append(memory_type)
+    if topic is not None:
+        conditions.append("topic = ?")
+        params.append(topic)
+    if not include_inactive:
+        conditions.append("active = 1")
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    query = (
+        "SELECT id, memory_type, topic, content, normalized_content, "
+        "evidence_count, confidence, source_conversation_id, source_message_id, "
+        "confirmed, active, created_at, updated_at FROM learning_memories "
+        f"{where} ORDER BY updated_at DESC, rowid DESC"
+    )
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [_row_to_dict(row) for row in rows]
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("记忆列表读取失败：数据库错误。") from exc
+
+
+def deactivate_memory(
+    memory_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """停用记忆（active=0）并刷新 updated_at；记忆不存在时抛出 RepositoryError。"""
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE learning_memories SET active = 0, updated_at = ? "
+                "WHERE id = ?",
+                (now, memory_id),
+            )
+            if cursor.rowcount == 0:
+                raise RepositoryError("记忆不存在，无法停用。")
+            row = conn.execute(
+                "SELECT id, memory_type, topic, content, normalized_content, "
+                "evidence_count, confidence, source_conversation_id, "
+                "source_message_id, confirmed, active, created_at, updated_at "
+                "FROM learning_memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            return _row_to_dict(row)
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("记忆停用失败：数据库错误。") from exc
+
+
+def delete_memory(
+    memory_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> bool:
+    """删除记忆；返回是否删除成功。"""
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM learning_memories WHERE id = ?",
+                (memory_id,),
+            )
+            return cursor.rowcount > 0
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("记忆删除失败：数据库错误。") from exc

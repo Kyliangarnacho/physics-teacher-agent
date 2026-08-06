@@ -1,8 +1,25 @@
-"""千问 API 配置加载。"""
+"""千问 API 与本地数据库路径配置加载。"""
 
 import os
 
 from dotenv import load_dotenv
+
+
+DEFAULT_DATABASE_PATH = "data/runtime/physics_teacher.db"
+
+
+def get_database_path() -> str:
+    """读取本地 SQLite 数据库路径。
+
+    优先使用可选环境变量 PHYSICS_AGENT_DB_PATH；未配置或为空时使用默认路径
+    ``data/runtime/physics_teacher.db``。该函数只读取文件系统路径，不校验任何
+    API Key 或模型配置。
+    """
+    load_dotenv()
+    value = os.getenv("PHYSICS_AGENT_DB_PATH")
+    if value and value.strip():
+        return value.strip()
+    return DEFAULT_DATABASE_PATH
 
 
 def load_qwen_config() -> tuple[str, str, str]:

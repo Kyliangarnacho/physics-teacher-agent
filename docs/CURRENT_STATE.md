@@ -1,11 +1,10 @@
 # 当前状态
 
-## Stage 09 状态
+## Stage 10 状态
 
 “初中物理教师 Agent + 阿里云百炼千问 API”当前使用 `qwen3.7-flash`，提示词版本仍为
-`teacher_v3_personal_humor`。Stage 09 已在既有 Router、RAG、Tool、有限 Retry 与 Trace
-基础上加入视觉理解、可选 OCR、最多 3 张图片的 Batch、附件与 Ctrl+V 粘贴，以及清晰内容
-自动采用、不确定内容人工确认的页面流程。
+`teacher_v3_personal_humor`。Stage 10 在 Stage 09 视觉/多图基础上加入 SQLite 持久会话、
+多会话管理、最近历史与教学状态，以及长期学习记忆的手动提取、确认和召回。
 
 当前个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心。幽默仅在语境自然匹配时
 偶尔出现，不要求每题都有。
@@ -33,7 +32,14 @@
 - `src/retry.py`：提供至多重试一次的通用有限 Retry
 - `src/vision/`：图片预处理、视觉/OCR Client、结果合并、安全上下文及多图 Batch
 - `src/ui/paste_images.py`：图片粘贴辅助和哈希去重；原生附件上传仍可独立使用
+- `src/storage/`：SQLite 连接、Migration V1（五张表）与 Repository 数据访问层
+- `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析与 Conversation Service
+- `src/memory/`：长期记忆候选提取、确认、检索与模型注入
 - `scripts/probe_stage09_vision.py`：视觉模型结构化提取能力的人工诊断探针
+- `scripts/probe_stage10_conversation_context.py` / `probe_stage10_conversation_service.py`：
+  历史/状态注入与两轮会话的真实探针
+- `scripts/probe_stage10_memory_candidates.py` / `probe_stage10_memory_retrieval.py` /
+  `probe_stage10_memory_page.py`：长期记忆候选、检索与页面交互的真实探针
 - `scripts/probe_stage07_function_calling.py`：底层 Function Calling 人工诊断探针
 - `scripts/probe_stage07_agent_e2e.py`：统一 Agent 真实端到端验收探针
 - `scripts/validate_knowledge_base.py`：校验知识库 JSONL、字段、类型和 ID 唯一性
@@ -138,15 +144,24 @@ Analyzer 的 `calculation_required=true` 且条件完整时，Router 设置 `use
 Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、工具选择、工具结果回传三次
 模型请求。Registry 的参数校验和物理计算完全在本地执行，不属于模型请求。
 
-## 会话行为
+## 会话与持久化
 
-`st.session_state` 只保存当前浏览器会话/标签页中的消息。新 Assistant 消息保存
-`content`、`sources`、`analysis`、`route`、`analysis_fallback`、`tool_records`、
-`tool_model_requests` 和 `trace`，页面可折叠显示 Agent 决策、来源、“本地计算工具记录”
-和“Agent 运行轨迹”；旧格式消息仍能安全显示。
+SQLite 是持久消息的 Source of Truth，`st.session_state` 只保存当前会话 ID、会话列表
+缓存和未发送图片、待确认图片、输入控件等页面临时状态。支持多会话新建、切换、重命名、
+清空（保留会话）与删除；浏览器新会话或服务重启后，历史从 SQLite 恢复。
 
-浏览器新会话、硬刷新导致会话重建或服务重启后，历史不会持久化。页面显示历史不等于
-模型记忆；每次模型请求仍只发送当前问题，不发送完整页面历史。
+页面使用 `list_messages` 恢复历史并用 `display_content` 渲染；assistant 的 sources、
+route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 3 个完整轮次
+（6000 字符）与教学状态（含连续 hint）会注入 Analyzer、普通回答、RAG 和 Tool 链路；
+当前问题始终是最后一条 user 消息。
+
+## 长期记忆流程
+
+- 成功回答下方可点击“分析本轮学习表现”手动提取候选（不自动提取）；
+- 候选暂存 `session_state`（按会话与消息隔离），确认保存后才写入 learning_memories；
+- 只有 `confirmed=1` 且 `active=1` 的记忆会被召回并注入相关题目；
+- “学习档案”展示已确认记忆，支持停用和删除；
+- 提取/确认失败显示安全错误，不泄露密钥、SQL 或路径。
 
 ## 验证状态
 
@@ -166,7 +181,7 @@ Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、�
 - BM25 默认 `top_k=3`、`min_score_ratio=0.3`
 - 检索器固定查询能够命中对应电路、凸透镜和电热器卡片
 - context 注入、无来源回退、sources 顺序和精简字段均有 mock/fake 测试
-- 当前共有 393 项单元测试，全部通过
+- 当前共有 581 项单元测试，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，并真实验证电热器、凸透镜 RAG 问答
 - 加入相对分数过滤后再次验证电热器问题，网页来源只返回 `KB-POWER-001`
 - 页面与终端验证过程中没有出现应用 traceback
@@ -193,6 +208,10 @@ Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、�
 - Streamlit Trace 专项测试与完整回归通过，服务启动检查返回 HTTP 200
 - Stage 09 的单图、多图、图片无文字默认问题、可选 OCR、自适应确认、缓存去重、图片上下文
   进入 RAG/Tool，以及附件与粘贴图片合并均有测试覆盖
+- Stage 10 SQLite 会话、多会话管理、重启恢复、历史/状态/记忆注入、长期记忆页面交互
+  均有本地测试覆盖；全量回归 581/581
+- Stage 10 真实探针验证：两轮会话 hint_step 递增、记忆确认后写入且停用后不再召回；
+  Streamlit HTTP 200 且无 traceback
 
 用户已手动验证：
 
@@ -215,8 +234,16 @@ Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、�
 Stage 08 的 8 道题是工程路径小样本，未对全部回答进行系统人工物理评分，不能代表完整初中
 物理能力。真实评测只有 5/8 路由与人工预期一致，说明自动模式与知识库策略仍可能偏离预期。
 
-当前没有真正的多轮上下文记忆，页面历史不会传入模型，也不会跨浏览器新会话或服务重启
-持久化。当前工具链一次只执行一个工具，不支持多工具并行、连续工具调用或工具循环。
+本地 SQLite 是单用户设计，没有登录和多用户隔离。工具链仍以单工具单次执行为主，复杂
+多问可能受限；模型偶尔可能生成字符串 `"None"` 等非法工具参数，Registry 会拒绝。
+长期记忆检索目前是关键词确定性近似。未确认候选只存在 `session_state`；暂无重新启用
+长期记忆的页面操作；V1 没有单独持久化 assistant 的 analysis 字段。
 图片理解仍可能受清晰度、手写内容和复杂图形影响；一次最多处理 3 张图片，OCR 只有在本地
 配置可用模型时才启用，不确定结果仍需人工确认。知识库仍只有 10 条卡片；尚未实现向量检索、
-数据库、长期记忆、MCP、微调或通用跨图片语义推理。
+MCP、微调或通用跨图片语义推理。
+
+## 本地评测参考题库
+
+`data/raw/原始题库 Word/精品解析：2025年广东省广州市天河区中考一模物理试题（解析版）.docx`
+仅作为本地测试参考（如第 13 题机械能、第 15 题多挡电路场景）。该目录被 Git 忽略，
+不复制试卷全文或解析进仓库。

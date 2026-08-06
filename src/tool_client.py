@@ -78,10 +78,21 @@ def answer_with_tools(
     completion_func: CompletionFunc | None = None,
     selection_should_retry: ShouldRetryFunc | None = None,
     result_should_retry: ShouldRetryFunc | None = None,
+    *,
+    teaching_state_context: str | None = None,
+    learning_memory_context: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Run one model-selected local tool and ask the model for a final answer."""
+    kwargs: dict[str, object] = {}
+    if teaching_state_context is not None:
+        kwargs["teaching_state_context"] = teaching_state_context
+    if learning_memory_context is not None:
+        kwargs["learning_memory_context"] = learning_memory_context
+    if conversation_history is not None:
+        kwargs["conversation_history"] = conversation_history
     messages: list[dict[str, Any]] = list(
-        build_messages(question, context, mode_instruction)
+        build_messages(question, context, mode_instruction, **kwargs)
     )
     request_options: dict[str, Any] = {}
 

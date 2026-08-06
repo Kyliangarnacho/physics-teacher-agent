@@ -2,9 +2,9 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 09：在既有
-Router、RAG、Tool、有限 Retry 和 Trace 基础上，加入图片视觉理解、可选 OCR、多图片聊天和
-人工确认流程。当前文本模型为 `qwen3.7-flash`，提示词版本仍为
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 10：在 Stage 09
+的视觉/多图基础上，加入 SQLite 持久会话、多会话管理、最近历史与教学状态，以及长期
+学习记忆的手动提取、确认和召回。当前文本模型为 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。
 
 ## 环境与配置
@@ -13,10 +13,12 @@ Router、RAG、Tool、有限 Retry 和 Trace 基础上，加入图片视觉理�
 - 主要依赖：`openai`、`python-dotenv`、`streamlit`、`pydantic`、`Pillow`、`jieba`、
   `rank-bm25`
 - 本地配置：`.env`
+- 本地 SQLite：`data/runtime/physics_teacher.db`（可用 `PHYSICS_AGENT_DB_PATH` 覆盖）
 - 当前模型：`qwen3.7-flash`
 
 `.env` 保存本地 API Key、Base URL 及文本/视觉/OCR 模型配置，已被 Git 忽略且不会提交。
 可复制 `.env.example` 后填写本地配置；OCR 模型未配置时会安全跳过 OCR 增强。
+本地 SQLite 数据库文件、`data/runtime/` 与 `*.db*` 均被 Git 忽略。
 
 ## 代码职责
 
@@ -42,6 +44,9 @@ Router、RAG、Tool、有限 Retry 和 Trace 基础上，加入图片视觉理�
 - `src/retry.py`：提供至多重试一次的通用有限 Retry，不负责业务错误分类
 - `src/vision/`：负责图片内存预处理、视觉提取、可选 OCR、结果合并、多图 Batch 与安全上下文
 - `src/ui/paste_images.py`：提供图片粘贴辅助与哈希去重；页面同时保留原生附件上传能力
+- `src/storage/`：SQLite 连接、Migration V1（五张表）与 Repository 数据访问层
+- `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析与 Conversation Service
+- `src/memory/`：长期记忆候选提取、确认、检索与模型注入
 - `scripts/probe_stage09_vision.py`：人工验证视觉模型、多模态消息和结构化提取能力
 - `scripts/probe_stage07_function_calling.py`：人工验证底层 Function Calling 兼容链路
 - `scripts/probe_stage07_agent_e2e.py`：人工验证统一 Agent 的真实工具端到端链路
@@ -56,6 +61,16 @@ Router、RAG、Tool、有限 Retry 和 Trace 基础上，加入图片视觉理�
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit` 和断点续跑的评测入口
 - `tests/`：使用 Python 标准库 `unittest` 验证 Schema、Analyzer、Router、Agent、
   检索、RAG、工具计算、Registry、Tool Client、Trace、Retry、视觉/OCR、多图页面和评测 Runner
+
+## Stage 10 持久会话与长期记忆
+
+Stage 10 当前实现：
+
+- SQLite 是持久消息的 Source of Truth；支持多会话新建、切换、重命名、清空、删除和重启恢复
+- 最近 3 个完整轮次、6000 字符的历史窗口与教学状态（含连续 hint）注入 Analyzer、
+  普通回答、RAG 和 Tool 链路
+- 长期学习记忆：点击“分析本轮学习表现”提取候选，用户确认后才写入；确认后的记忆会
+  在相关题目中召回，并可在“学习档案”中停用或删除
 
 ## Stage 09 图片理解与多图聊天
 
@@ -228,17 +243,13 @@ API 配置与费用时执行。
 
 ## 会话与请求行为
 
-网页使用 `st.session_state` 保存当前页面的用户消息和教师回答。新 Assistant 消息保存
-`content`、`sources`、`analysis`、`route`、`analysis_fallback`、`tool_records`、
-`tool_model_requests` 和 `trace`，因此同一会话内脚本重新运行时仍能显示当次决策、来源、
-工具记录和运行轨迹。
-旧消息缺少这些字段时也能安全显示。
+聊天历史与运行记录持久化在本地 SQLite（默认 `data/runtime/physics_teacher.db`），
+`st.session_state` 只保存当前会话 ID、会话列表缓存和图片/输入等页面临时状态。
+支持新建、切换、重命名、清空（保留会话）与删除会话；浏览器新会话或服务重启后，
+历史从 SQLite 恢复。
 
-历史仅属于当前浏览器会话/标签页。浏览器新会话、硬刷新导致会话重建或服务重启后，
-历史不会持久保存。
-
-页面可以显示多轮聊天记录，但每次调用模型时只发送当前问题，不发送页面中的完整历史，
-因此目前不是真正的多轮上下文对话。RAG context 也只来自当前问题的本次检索。
+每次模型请求会注入最近完整轮次（最多 3 轮、6000 字符）、已确认的教学状态，以及
+`confirmed=1` 且 `active=1` 的长期记忆；当前问题始终是最后一条 user 消息。
 
 ## 已完成验证
 
@@ -254,7 +265,7 @@ API 配置与费用时执行。
   `content`
 - Stage 05 知识库 10 条卡片通过结构与唯一性校验
 - 检索、RAG 编排和 context 消息均由 fake/mock 测试覆盖，不调用千问
-- 当前全部单元测试为 393 项，全部通过
+- 当前全部单元测试为 581 项，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，页面与终端没有出现应用 traceback
 - 已真实验证电热器和凸透镜 RAG 问答；加入相对分数过滤后再次验证电热器问题，网页来源
   只返回 `KB-POWER-001`
@@ -273,7 +284,9 @@ API 配置与费用时执行。
   匹配 5/8；总模型请求 18 次、RAG 检索 4 次、本地工具执行 3 次，无 fallback、Retry 或空回答
 - Stage 08 Streamlit Trace 专项测试通过，服务启动检查返回 HTTP 200
 - Stage 09 单图、多图、可选 OCR、自适应确认、图片上下文进入 RAG/Tool、附件与粘贴去重均有
-  本地测试覆盖；完整回归为 393/393
+  本地测试覆盖；完整回归为 581/581
+- Stage 10 SQLite 会话、多会话管理、重启恢复、历史/状态/记忆注入、长期记忆页面交互
+  均有本地测试覆盖；真实探针验证两轮会话与记忆确认/停用，Streamlit HTTP 200
 
 用户手动验证的网页结果：
 
@@ -297,8 +310,10 @@ Stage 08 的 8 道题只覆盖代表性工程路径，不是完整初中物理�
 系统人工物理评分。真实运行的 5/8 路由匹配说明自动分类仍有偏差，当前结果不能证明所有题型
 都能稳定选择预期模式或知识库策略。
 
-模型每次仍只接收当前问题，没有真正的多轮上下文记忆；页面显示历史不等于模型记忆。
-当前工具链一次只允许执行一个工具，不支持多个或并行工具调用，也不支持工具调用循环。
+本地 SQLite 是单用户设计，没有登录和多用户隔离。工具链仍以单工具单次执行为主，复杂
+多问可能受限；模型偶尔可能生成字符串 `"None"` 等非法工具参数，Registry 会拒绝。
+长期记忆检索目前是关键词确定性近似。未确认候选只存在 `session_state`；暂无重新启用
+长期记忆的页面操作；V1 没有单独持久化 assistant 的 analysis 字段。
 图片理解依赖视觉模型输出，模糊文字、手写内容和复杂图形仍可能需要人工确认；一次提交最多
-3 张图片，OCR 仅在已配置可用模型时启用。知识库仍只有 10 条文本卡片，BM25 覆盖有限。
-当前未实现数据库、长期记忆、MCP、微调或通用的跨图片语义推理。
+3 张图片，OCR 仅在已配置可用模型时启用。知识库仍只有 10 条文本卡片，BM25 覆盖有限；
+尚未实现向量检索、MCP、微调或通用跨图片语义推理。

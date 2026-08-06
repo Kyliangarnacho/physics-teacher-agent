@@ -1,14 +1,18 @@
-"""No-API Streamlit tests for unified text and image submissions."""
+"""Stage 10 无 API Streamlit 文本与图片提交流程测试（SQLite 持久化）。"""
 
 from __future__ import annotations
 
-from io import BytesIO
+import os
+import tempfile
 import unittest
+from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
 from streamlit.testing.v1 import AppTest
 
+from src.storage import initialize_database, list_messages
 from src.vision.schemas import ImageQuestionExtraction
 
 
@@ -71,7 +75,13 @@ def agent_result() -> dict[str, object]:
         "analysis_fallback": False,
         "tool_records": [],
         "tool_model_requests": 0,
-        "trace": None,
+        "trace": {
+            "status": "completed",
+            "total_model_requests": 1,
+            "total_duration_ms": 1.0,
+            "run_id": "run-fixed",
+            "steps": [],
+        },
     }
 
 
@@ -90,6 +100,23 @@ def button(app: AppTest, label: str):
 
 
 class AppImageFlowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_dir.cleanup)
+        self.db_path = str(Path(self._temp_dir.name) / "physics_teacher.db")
+        os.environ["PHYSICS_AGENT_DB_PATH"] = self.db_path
+        initialize_database(self.db_path)
+
+    def tearDown(self) -> None:
+        os.environ.pop("PHYSICS_AGENT_DB_PATH", None)
+
+    def agent_patch(self, side_effect=None, return_value=None):
+        return patch(
+            "src.conversation.service._default_run_agent",
+            side_effect=side_effect,
+            return_value=return_value,
+        )
+
     def test_chat_input_enables_multiple_supported_files(self) -> None:
         app = AppTest.from_file("app.py")
         app.run()
@@ -98,22 +125,25 @@ class AppImageFlowTests(unittest.TestCase):
         self.assertEqual(list(proto.file_type), [".jpg", ".jpeg", ".png", ".webp"])
         self.assertEqual(proto.max_upload_size_mb, 8)
 
-    def test_plain_text_keeps_legacy_agent_call(self) -> None:
+    def test_plain_text_submission_goes_through_service(self) -> None:
         calls = []
 
         def fake_agent(question, **kwargs):
             calls.append((question, kwargs))
             return agent_result()
 
-        with patch("src.agent.run_teacher_agent", side_effect=fake_agent):
+        with self.agent_patch(side_effect=fake_agent):
             app = AppTest.from_file("app.py")
             app.run()
             app.chat_input[0].set_value("为什么金属摸起来更凉？").run()
 
         self.assertEqual(calls[0][0], "为什么金属摸起来更凉？")
+        self.assertEqual(calls[0][1]["mode_override"], "auto")
+        self.assertEqual(calls[0][1]["rag_policy"], "auto")
+        conversation_id = app.session_state["current_conversation_id"]
         self.assertEqual(
-            calls[0][1],
-            {"mode_override": "auto", "rag_policy": "auto"},
+            [message["role"] for message in list_messages(conversation_id)],
+            ["user", "assistant"],
         )
 
     def test_text_and_multiple_images_run_once_and_preserve_order(self) -> None:
@@ -135,7 +165,7 @@ class AppImageFlowTests(unittest.TestCase):
         )
         with (
             patch("src.vision.batch.analyze_uploaded_image", side_effect=fake_vision),
-            patch("src.agent.run_teacher_agent", side_effect=fake_agent),
+            self.agent_patch(side_effect=fake_agent),
         ):
             app.run()
 
@@ -144,6 +174,13 @@ class AppImageFlowTests(unittest.TestCase):
         context = agent_calls[0][1]["image_context"]
         self.assertLess(context.index("paste.png"), context.index("attach.png"))
         self.assertTrue(agent_calls[0][1]["image_context_available"])
+        conversation_id = app.session_state["current_conversation_id"]
+        messages = list_messages(conversation_id)
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["user", "assistant"],
+        )
+        self.assertEqual(messages[0]["image_metadata_json"]["image_count"], 2)
 
     def test_duplicate_paste_and_attachment_are_sent_once(self) -> None:
         same_bytes = png_bytes("blue")
@@ -160,14 +197,16 @@ class AppImageFlowTests(unittest.TestCase):
                     vision_calls.append(filename) or service_result(name=filename)
                 ),
             ),
-            patch("src.agent.run_teacher_agent", return_value=agent_result()),
+            self.agent_patch(return_value=agent_result()),
         ):
             app.run()
 
         self.assertEqual(vision_calls, ["pasted.png"])
-        user_message = app.session_state["messages"][0]
-        self.assertEqual(user_message["image_count"], 1)
-        self.assertEqual(user_message["image_filenames"], ["pasted.png"])
+        conversation_id = app.session_state["current_conversation_id"]
+        user_message = list_messages(conversation_id)[0]
+        metadata = user_message["image_metadata_json"]
+        self.assertEqual(metadata["image_count"], 1)
+        self.assertEqual(metadata["image_filenames"], ["pasted.png"])
 
     def test_image_only_uses_safe_default_question(self) -> None:
         calls = []
@@ -180,8 +219,7 @@ class AppImageFlowTests(unittest.TestCase):
                 "src.vision.batch.analyze_uploaded_image",
                 return_value=service_result(name="only"),
             ),
-            patch(
-                "src.agent.run_teacher_agent",
+            self.agent_patch(
                 side_effect=lambda question, **kwargs: (
                     calls.append((question, kwargs)) or agent_result()
                 ),
@@ -201,12 +239,14 @@ class AppImageFlowTests(unittest.TestCase):
         app = app_with_submission("测试", attached=images)
         with (
             patch("src.vision.batch.analyze_uploaded_image") as vision,
-            patch("src.agent.run_teacher_agent") as agent,
+            self.agent_patch() as agent,
         ):
             app.run()
         self.assertEqual(vision.call_count, 0)
         self.assertEqual(agent.call_count, 0)
         self.assertTrue(any("最多提交 3 张" in str(item.value) for item in app.warning))
+        conversation_id = app.session_state["current_conversation_id"]
+        self.assertEqual(list_messages(conversation_id), [])
 
     def test_confirmation_pauses_then_continues_without_reanalysis(self) -> None:
         app = app_with_submission(
@@ -222,7 +262,7 @@ class AppImageFlowTests(unittest.TestCase):
                     name="check",
                 ),
             ) as vision,
-            patch("src.agent.run_teacher_agent", return_value=agent_result()) as agent,
+            self.agent_patch(return_value=agent_result()) as agent,
         ):
             app.run()
             self.assertEqual(agent.call_count, 0)
@@ -232,6 +272,8 @@ class AppImageFlowTests(unittest.TestCase):
         self.assertEqual(vision.call_count, 1)
         self.assertEqual(agent.call_count, 1)
         self.assertNotIn("pending_submission", app.session_state)
+        conversation_id = app.session_state["current_conversation_id"]
+        self.assertEqual(len(list_messages(conversation_id)), 2)
 
     def test_unreadable_image_blocks_agent(self) -> None:
         app = app_with_submission(
@@ -243,11 +285,13 @@ class AppImageFlowTests(unittest.TestCase):
                 "src.vision.batch.analyze_uploaded_image",
                 return_value=service_result(status="unreadable", name="bad"),
             ),
-            patch("src.agent.run_teacher_agent") as agent,
+            self.agent_patch() as agent,
         ):
             app.run()
         self.assertEqual(agent.call_count, 0)
         self.assertTrue(any("无法识别" in str(item.value) for item in app.error))
+        conversation_id = app.session_state["current_conversation_id"]
+        self.assertEqual(list_messages(conversation_id), [])
 
     def test_cache_and_completed_batch_do_not_pollute_next_text_turn(self) -> None:
         agent_calls = []
@@ -260,8 +304,7 @@ class AppImageFlowTests(unittest.TestCase):
                 "src.vision.batch.analyze_uploaded_image",
                 return_value=service_result(name="same"),
             ) as vision,
-            patch(
-                "src.agent.run_teacher_agent",
+            self.agent_patch(
                 side_effect=lambda question, **kwargs: (
                     agent_calls.append((question, kwargs)) or agent_result()
                 ),
@@ -273,7 +316,7 @@ class AppImageFlowTests(unittest.TestCase):
         self.assertEqual(vision.call_count, 1)
         self.assertEqual(len(agent_calls), 2)
         self.assertIn("image_context", agent_calls[0][1])
-        self.assertNotIn("image_context", agent_calls[1][1])
+        self.assertIsNone(agent_calls[1][1].get("image_context"))
 
     def test_plain_rerun_after_image_send_does_not_repeat_vision(self) -> None:
         app = app_with_submission(
@@ -285,13 +328,13 @@ class AppImageFlowTests(unittest.TestCase):
                 "src.vision.batch.analyze_uploaded_image",
                 return_value=service_result(name="once"),
             ) as vision,
-            patch("src.agent.run_teacher_agent", return_value=agent_result()),
+            self.agent_patch(return_value=agent_result()),
         ):
             app.run()
             app.run()
         self.assertEqual(vision.call_count, 1)
 
-    def test_clear_conversation_removes_pending_batch_and_pasted_state(self) -> None:
+    def test_clear_current_conversation_clears_pending_and_messages(self) -> None:
         app = app_with_submission(
             "请核对",
             attached=[image_item("pending.png", png_bytes())],
@@ -305,7 +348,7 @@ class AppImageFlowTests(unittest.TestCase):
                     name="pending",
                 ),
             ),
-            patch("src.agent.run_teacher_agent"),
+            self.agent_patch(),
         ):
             app.run()
             app.session_state["paste_image_bridge"] = {
@@ -317,9 +360,10 @@ class AppImageFlowTests(unittest.TestCase):
                     }
                 ]
             }
-            button(app, "清空当前对话").click().run()
+            button(app, "清空当前会话").click().run()
 
-        self.assertEqual(app.session_state["messages"], [])
+        conversation_id = app.session_state["current_conversation_id"]
+        self.assertEqual(list_messages(conversation_id), [])
         self.assertNotIn("pending_submission", app.session_state)
         self.assertNotIn("pending_chat_submission", app.session_state)
         self.assertNotIn("paste_image_bridge", app.session_state)
@@ -334,13 +378,14 @@ class AppImageFlowTests(unittest.TestCase):
                 "src.vision.batch.analyze_uploaded_image",
                 return_value=service_result(name="safe"),
             ),
-            patch("src.agent.run_teacher_agent", return_value=agent_result()),
+            self.agent_patch(return_value=agent_result()),
         ):
             app.run()
 
+        conversation_id = app.session_state["current_conversation_id"]
         serialized = str(
             {
-                "messages": app.session_state["messages"],
+                "messages": list_messages(conversation_id),
                 "cache": app.session_state["vision_batch_cache"],
             }
         )
@@ -350,9 +395,7 @@ class AppImageFlowTests(unittest.TestCase):
         self.assertNotIn("bytes", serialized)
 
     def test_native_chat_input_does_not_mount_duplicate_paste_preview(self) -> None:
-        with patch(
-            "src.agent.run_teacher_agent", return_value=agent_result()
-        ) as agent:
+        with self.agent_patch(return_value=agent_result()) as agent:
             app = AppTest.from_file("app.py")
             app.run()
             app.chat_input[0].set_value("纯文字仍可用").run()
