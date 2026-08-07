@@ -28,6 +28,7 @@ from src.storage import (
     list_messages,
     rename_conversation,
 )
+from src.ui import editable_conversation_title
 from src.ui.paste_images import decode_pasted_images
 from src.vision.batch import (
     build_batch_image_context,
@@ -1152,30 +1153,20 @@ with st.sidebar:
         cid = str(conversation.get("id", ""))
         is_current = cid == current_conversation_id
         with st.container(key=f"conversation_item_{cid}"):
-            st.markdown(
-                f"{':material/chat:' if is_current else ':material/chat_bubble_outline:'} "
-                f"{conversation.get('title', '新对话')}"
-                + ("　· 当前" if is_current else "")
+            updated_title = editable_conversation_title(
+                str(conversation.get("title", "新对话")),
+                current=is_current,
+                key=f"conversation_title_{cid}",
             )
-            select_col, rename_col, delete_col = st.columns([2, 1, 1])
+            if updated_title is not None:
+                rename_conversation_from_sidebar(cid, updated_title)
+            select_col, delete_col = st.columns(2)
             with select_col:
                 if st.button("打开", key=f"select_conv_{cid}", width="content"):
                     select_conversation(cid)
-            with rename_col:
-                if st.button("重命名", key=f"rename_btn_{cid}", width="content"):
-                    rename_conversation_from_sidebar(
-                        cid,
-                        st.session_state.get(f"rename_input_{cid}", ""),
-                    )
             with delete_col:
                 if st.button("删除", key=f"delete_conv_{cid}", width="content"):
                     delete_conversation_from_sidebar(cid)
-            st.text_input(
-                "会话标题",
-                value=str(conversation.get("title", "")),
-                key=f"rename_input_{cid}",
-                label_visibility="collapsed",
-            )
     st.divider()
 
     st.markdown("##### 当前对话")

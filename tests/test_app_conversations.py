@@ -152,10 +152,13 @@ class AppConversationTests(unittest.TestCase):
         second = create_conversation("第二个", path=self.db_path)
         app = self.run_app(current_conversation_id=first["id"])
 
-        rendered = [str(item.value) for item in app.markdown]
+        cached_titles = [
+            str(item.get("title", ""))
+            for item in app.session_state["conversation_cache"]
+        ]
         self.assertLess(
-            next(index for index, value in enumerate(rendered) if "第二个" in value),
-            next(index for index, value in enumerate(rendered) if "第一个" in value),
+            cached_titles.index("第二个"),
+            cached_titles.index("第一个"),
         )
 
         self.button_by_key(app, "new_conversation").click().run()
@@ -182,19 +185,18 @@ class AppConversationTests(unittest.TestCase):
         self.assertNotIn("A 的问题", rendered)
         self.assertEqual(len(list_messages(conv_b["id"], path=self.db_path)), 0)
 
-    def test_rename_conversation_updates_title(self) -> None:
+    def test_conversation_title_editor_replaces_old_rename_controls(self) -> None:
         conv = create_conversation("旧标题", path=self.db_path)
         app = self.run_app(current_conversation_id=conv["id"])
 
-        rename_input = next(
-            item for item in app.text_input if item.key == f"rename_input_{conv['id']}"
+        self.assertFalse(
+            any(item.key == f"rename_btn_{conv['id']}" for item in app.button)
         )
-        rename_input.set_value("新标题").run()
-        self.button_by_key(app, f"rename_btn_{conv['id']}").click().run()
-
-        self.assertEqual(
-            get_conversation(conv["id"], path=self.db_path)["title"],
-            "新标题",
+        self.assertFalse(
+            any(
+                item.key == f"rename_input_{conv['id']}"
+                for item in app.text_input
+            )
         )
         self.assertEqual(len(app.exception), 0)
 
