@@ -6,11 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from src.tool_client import answer_with_tools
-from src.tools.registry import (
-    ToolExecutionRecord,
-    ToolExecutionStatus,
-    execute_tool_call,
-)
+from src.tools.registry import execute_tool_call
 from tests.test_tool_client import (
     FakeCompletion,
     completion_response,
@@ -55,6 +51,30 @@ class ToolClientObservabilityTests(unittest.TestCase):
             [1, 0, 1],
         )
         self.assertEqual(result["model_requests"], 2)
+
+    def test_no_tool_needed_uses_traced_model_only_answer(self) -> None:
+        fake = FakeCompletion(
+            [
+                completion_response(tool_calls=[], content="direct answer"),
+            ]
+        )
+
+        result = answer_with_tools("求电流。", completion_func=fake)
+
+        self.assertEqual(
+            [trace["name"] for trace in result["step_traces"]],
+            ["tool_selection", "tool_execution", "tool_result_answer"],
+        )
+        self.assertEqual(trace_by_name(result, "tool_selection")["status"], "success")
+        self.assertEqual(
+            trace_by_name(result, "tool_selection")["metadata"]["decision"],
+            "no_tool_needed",
+        )
+        self.assertEqual(trace_by_name(result, "tool_execution")["status"], "skipped")
+        final_trace = trace_by_name(result, "tool_result_answer")
+        self.assertEqual(final_trace["status"], "skipped")
+        self.assertEqual(final_trace["metadata"]["answer_strategy"], "model_only")
+        self.assertEqual(result["model_requests"], 1)
 
     def test_tool_selection_first_failure_then_success_is_retried(self) -> None:
         fake = FakeCompletion(
@@ -119,74 +139,6 @@ class ToolClientObservabilityTests(unittest.TestCase):
         self.assertEqual(selection["model_requests"], 2)
         self.assertEqual(selection["error_type"], "tool_selection_api")
         self.assertEqual(trace_by_name(result, "tool_execution")["status"], "skipped")
-
-    def test_protocol_error_is_not_retried(self) -> None:
-        fake = FakeCompletion(
-            [completion_response(tool_calls=[], content="direct answer")]
-        )
-
-        result = answer_with_tools("求电流。", completion_func=fake)
-
-        selection = trace_by_name(result, "tool_selection")
-        self.assertEqual(len(fake.calls), 1)
-        self.assertEqual(selection["status"], "error")
-        self.assertEqual(selection["attempts"], 1)
-        self.assertEqual(selection["model_requests"], 1)
-        self.assertEqual(selection["error_type"], "tool_protocol")
-
-    def test_parameter_validation_error_is_not_retried(self) -> None:
-        fake = FakeCompletion(
-            [
-                completion_response(
-                    tool_calls=[
-                        tool_call(
-                            arguments=(
-                                '{"voltage_v": "12 V", '
-                                '"resistance_ohm": "6"}'
-                            )
-                        )
-                    ]
-                )
-            ]
-        )
-
-        result = answer_with_tools("求电流。", completion_func=fake)
-
-        execution = trace_by_name(result, "tool_execution")
-        self.assertEqual(len(fake.calls), 1)
-        self.assertEqual(execution["status"], "error")
-        self.assertEqual(execution["attempts"], 1)
-        self.assertEqual(execution["model_requests"], 0)
-        self.assertEqual(execution["error_type"], "tool_validation")
-        self.assertEqual(
-            trace_by_name(result, "tool_result_answer")["status"],
-            "skipped",
-        )
-
-    def test_local_tool_error_is_not_retried(self) -> None:
-        error_record = ToolExecutionRecord(
-            tool_call_id="call-ohms",
-            name="calculate_ohms_law",
-            arguments={"voltage_v": 12, "resistance_ohm": 6},
-            status=ToolExecutionStatus.ERROR,
-            result=None,
-            error="工具计算失败，参数不满足计算要求。",
-        )
-        fake = FakeCompletion([successful_selection()])
-
-        with patch(
-            "src.tool_client.execute_tool_call",
-            return_value=error_record,
-        ) as mocked_execute:
-            result = answer_with_tools("求电流。", completion_func=fake)
-
-        execution = trace_by_name(result, "tool_execution")
-        self.assertEqual(len(fake.calls), 1)
-        mocked_execute.assert_called_once()
-        self.assertEqual(execution["status"], "error")
-        self.assertEqual(execution["attempts"], 1)
-        self.assertEqual(execution["model_requests"], 0)
-        self.assertEqual(execution["error_type"], "tool_execution")
 
     def test_final_result_api_failure_does_not_repeat_tool(self) -> None:
         fake = FakeCompletion(

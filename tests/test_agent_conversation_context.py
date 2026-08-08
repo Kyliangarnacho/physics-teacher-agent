@@ -423,7 +423,16 @@ class ToolClientContextTests(unittest.TestCase):
         first = fake.calls[0]["messages"]
         self.assertEqual(
             [message["role"] for message in first],
-            ["system", "system", "system", "system", "user", "assistant", "user"],
+            [
+                "system",
+                "system",
+                "system",
+                "system",
+                "user",
+                "assistant",
+                "system",
+                "user",
+            ],
         )
         self.assertEqual(first[-1], {"role": "user", "content": "电压 12 V，电阻 6 Ω，求电流。"})
         self.assertEqual(count_occurrences(first, "教学状态"), 1)

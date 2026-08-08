@@ -16,14 +16,18 @@ from src.tools.physics_calculators import (
     calculate_average_speed,
     calculate_density,
     calculate_electric_power,
+    calculate_mechanical_power,
     calculate_ohms_law,
+    calculate_pulley_efficiency,
     convert_physics_unit,
 )
 from src.tools.schemas import (
     AverageSpeedParameters,
     DensityParameters,
     ElectricPowerParameters,
+    MechanicalPowerParameters,
     OhmsLawParameters,
+    PulleyEfficiencyParameters,
     UnitConversionParameters,
 )
 
@@ -82,6 +86,20 @@ _TOOL_REGISTRY: dict[str, _ToolRegistration] = {
         parameters_model=DensityParameters,
         function=calculate_density,
         numeric_fields=("mass_kg", "volume_m3"),
+    ),
+    "calculate_mechanical_power": _ToolRegistration(
+        name="calculate_mechanical_power",
+        description="根据功和时间计算机械功率。",
+        parameters_model=MechanicalPowerParameters,
+        function=calculate_mechanical_power,
+        numeric_fields=("work_j", "time_s"),
+    ),
+    "calculate_pulley_efficiency": _ToolRegistration(
+        name="calculate_pulley_efficiency",
+        description="根据物重、提升高度、拉力和绳端移动距离计算滑轮效率。",
+        parameters_model=PulleyEfficiencyParameters,
+        function=calculate_pulley_efficiency,
+        numeric_fields=("weight_n", "height_m", "force_n", "distance_m"),
     ),
     "calculate_ohms_law": _ToolRegistration(
         name="calculate_ohms_law",

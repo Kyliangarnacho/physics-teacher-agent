@@ -8,13 +8,15 @@ from src.tools.schemas import (
     AverageSpeedParameters,
     DensityParameters,
     ElectricPowerParameters,
+    MechanicalPowerParameters,
     OhmsLawParameters,
+    PulleyEfficiencyParameters,
     UnitConversionParameters,
 )
 
 
 class ToolSchemaValidationTests(unittest.TestCase):
-    def test_five_parameter_models_accept_valid_inputs(self):
+    def test_seven_parameter_models_accept_valid_inputs(self):
         self.assertEqual(
             AverageSpeedParameters(distance_m=50, time_s=10).distance_m,
             Decimal("50"),
@@ -22,6 +24,19 @@ class ToolSchemaValidationTests(unittest.TestCase):
         self.assertEqual(
             DensityParameters(mass_kg=2.7, volume_m3=0.001).mass_kg,
             Decimal("2.7"),
+        )
+        self.assertEqual(
+            MechanicalPowerParameters(work_j=120, time_s=10).work_j,
+            Decimal("120"),
+        )
+        self.assertEqual(
+            PulleyEfficiencyParameters(
+                weight_n=100,
+                height_m=2,
+                force_n=50,
+                distance_m=5,
+            ).force_n,
+            Decimal("50"),
         )
         self.assertIsNone(
             OhmsLawParameters(voltage_v=6, resistance_ohm=3).current_a
@@ -72,6 +87,52 @@ class ToolSchemaValidationTests(unittest.TestCase):
         )
         for model, parameters in invalid_models:
             with self.subTest(model=model.__name__, parameters=parameters):
+                with self.assertRaises(ValidationError):
+                    model(**parameters)
+
+    def test_mechanical_power_and_pulley_efficiency_boundaries(self):
+        self.assertEqual(
+            MechanicalPowerParameters(work_j=0, time_s=1).work_j,
+            Decimal("0"),
+        )
+        self.assertEqual(
+            PulleyEfficiencyParameters(
+                weight_n=0,
+                height_m=0,
+                force_n=1,
+                distance_m=1,
+            ).weight_n,
+            Decimal("0"),
+        )
+        for model, parameters in (
+            (MechanicalPowerParameters, {"work_j": -1, "time_s": 1}),
+            (MechanicalPowerParameters, {"work_j": 1, "time_s": 0}),
+            (
+                PulleyEfficiencyParameters,
+                {"weight_n": -1, "height_m": 1, "force_n": 1, "distance_m": 1},
+            ),
+            (
+                PulleyEfficiencyParameters,
+                {"weight_n": 1, "height_m": 1, "force_n": 0, "distance_m": 1},
+            ),
+            (
+                PulleyEfficiencyParameters,
+                {"weight_n": 1, "height_m": 1, "force_n": 1, "distance_m": 0},
+            ),
+        ):
+            with self.subTest(model=model.__name__, parameters=parameters):
+                with self.assertRaises(ValidationError):
+                    model(**parameters)
+
+    def test_new_numeric_parameters_reject_none_string(self):
+        for model, parameters in (
+            (MechanicalPowerParameters, {"work_j": "None", "time_s": 1}),
+            (
+                PulleyEfficiencyParameters,
+                {"weight_n": 1, "height_m": 1, "force_n": "None", "distance_m": 1},
+            ),
+        ):
+            with self.subTest(model=model.__name__):
                 with self.assertRaises(ValidationError):
                     model(**parameters)
 
@@ -182,6 +243,21 @@ class ToolJsonSchemaTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["time_s"]["type"], "number")
         self.assertEqual(schema["properties"]["time_s"]["exclusiveMinimum"], 0)
         json.dumps(schema)
+
+    def test_new_tool_schemas_expose_strict_numeric_fields(self):
+        mechanical = MechanicalPowerParameters.model_json_schema()
+        pulley = PulleyEfficiencyParameters.model_json_schema()
+        self.assertFalse(mechanical["additionalProperties"])
+        self.assertEqual(set(mechanical["required"]), {"work_j", "time_s"})
+        self.assertEqual(mechanical["properties"]["work_j"]["type"], "number")
+        self.assertEqual(mechanical["properties"]["time_s"]["type"], "number")
+        self.assertFalse(pulley["additionalProperties"])
+        self.assertEqual(
+            set(pulley["required"]),
+            {"weight_n", "height_m", "force_n", "distance_m"},
+        )
+        self.assertEqual(pulley["properties"]["force_n"]["type"], "number")
+        json.dumps(pulley)
 
     def test_optional_fields_are_nullable_and_not_required(self):
         schema = OhmsLawParameters.model_json_schema()

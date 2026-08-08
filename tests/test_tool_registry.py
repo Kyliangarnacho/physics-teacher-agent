@@ -12,18 +12,20 @@ from src.tools.registry import (
 
 
 class OpenAIToolDefinitionsTests(unittest.TestCase):
-    def test_exactly_five_unique_tools_are_registered(self):
+    def test_exactly_seven_unique_tools_are_registered(self):
         tools = get_openai_tools()
         names = [tool["function"]["name"] for tool in tools]
-        self.assertEqual(len(tools), 5)
-        self.assertEqual(len(set(names)), 5)
+        self.assertEqual(len(tools), 7)
+        self.assertEqual(len(set(names)), 7)
         self.assertEqual(
             set(names),
             {
                 "calculate_average_speed",
                 "calculate_density",
+                "calculate_mechanical_power",
                 "calculate_ohms_law",
                 "calculate_electric_power",
+                "calculate_pulley_efficiency",
                 "convert_physics_unit",
             },
         )
@@ -63,7 +65,7 @@ class OpenAIToolDefinitionsTests(unittest.TestCase):
 
 
 class ToolExecutionTests(unittest.TestCase):
-    def test_all_five_tools_execute_successfully(self):
+    def test_all_seven_tools_execute_successfully(self):
         cases = (
             (
                 "calculate_average_speed",
@@ -76,6 +78,11 @@ class ToolExecutionTests(unittest.TestCase):
                 "4",
             ),
             (
+                "calculate_mechanical_power",
+                {"work_j": 120, "time_s": 10},
+                "12",
+            ),
+            (
                 "calculate_ohms_law",
                 {"voltage_v": 12, "resistance_ohm": 6},
                 "2",
@@ -84,6 +91,11 @@ class ToolExecutionTests(unittest.TestCase):
                 "calculate_electric_power",
                 {"voltage_v": 12, "current_a": 2},
                 "24",
+            ),
+            (
+                "calculate_pulley_efficiency",
+                {"weight_n": 100, "height_m": 2, "force_n": 50, "distance_m": 5},
+                "80",
             ),
             (
                 "convert_physics_unit",
@@ -228,6 +240,23 @@ class ToolExecutionTests(unittest.TestCase):
                 )
                 self.assertEqual(record.status, ToolExecutionStatus.ERROR)
                 self.assertEqual(record.normalized_fields, [])
+
+    def test_new_tools_normalize_only_pure_numeric_strings(self):
+        mechanical = execute_tool_call(
+            "call-mechanical-string",
+            "calculate_mechanical_power",
+            '{"work_j": "120", "time_s": "10"}',
+        )
+        pulley = execute_tool_call(
+            "call-pulley-invalid-string",
+            "calculate_pulley_efficiency",
+            '{"weight_n": "100", "height_m": "2", "force_n": "None", "distance_m": "5"}',
+        )
+        self.assertEqual(mechanical.status, ToolExecutionStatus.SUCCESS)
+        self.assertEqual(mechanical.normalized_fields, ["work_j", "time_s"])
+        self.assertEqual(mechanical.result["display_value"], "12")
+        self.assertEqual(pulley.status, ToolExecutionStatus.ERROR)
+        self.assertEqual(pulley.normalized_fields, ["weight_n", "height_m", "distance_m"])
 
     def test_boolean_is_not_normalized_and_is_rejected(self):
         record = execute_tool_call(

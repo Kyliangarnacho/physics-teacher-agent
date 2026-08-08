@@ -161,6 +161,112 @@ class AgentObservabilityTests(unittest.TestCase):
         self.assertEqual(result_step["attempts"], 2)
         self.assertEqual(result_step["model_requests"], 2)
 
+    def test_tool_repair_is_included_in_agent_request_statistics(self) -> None:
+        repair_payload = {
+            "repairs": [
+                {
+                    "tool_call_id": "call-ohms",
+                    "name": "calculate_ohms_law",
+                    "arguments": {"voltage_v": 12, "resistance_ohm": 6},
+                }
+            ]
+        }
+        completion = FakeCompletion(
+            [
+                completion_response(
+                    tool_calls=[
+                        tool_call(
+                            arguments=(
+                                '{"voltage_v": "12 V", '
+                                '"resistance_ohm": 6}'
+                            )
+                        )
+                    ]
+                ),
+                completion_response(content=json.dumps(repair_payload)),
+                completion_response(tool_calls=None, content="电流为 2 A。"),
+            ]
+        )
+
+        def repairing_tool_answer(
+            question: str,
+            context: str | None = None,
+            mode_instruction: str | None = None,
+        ) -> dict:
+            return answer_with_tools(
+                question,
+                context=context,
+                mode_instruction=mode_instruction,
+                completion_func=completion,
+            )
+
+        result = run_teacher_agent(
+            "电压为 12 V，电阻为 6 Ω，求电流。",
+            rag_policy="off",
+            analyzer_func=FakeAnalyzer(
+                analysis_json(calculation_required=True)
+            ),
+            answer_func=FakeAnswer(),
+            tool_answer_func=repairing_tool_answer,
+        )
+
+        trace = result["trace"]
+        repair_step = step_by_name(trace, "tool_repair")
+        self.assertEqual(result["tool_model_requests"], 3)
+        self.assertEqual(trace["total_model_requests"], 4)
+        self.assertEqual(trace["tool_executions"], 2)
+        self.assertEqual(repair_step["model_requests"], 1)
+        self.assertEqual(repair_step["metadata"]["repaired_success_count"], 1)
+
+    def test_model_only_tool_fallback_sets_completed_with_fallback(self) -> None:
+        completion = FakeCompletion(
+            [
+                completion_response(
+                    tool_calls=[
+                        tool_call(
+                            arguments=(
+                                '{"voltage_v": "12 V", '
+                                '"resistance_ohm": 6}'
+                            )
+                        )
+                    ]
+                ),
+                completion_response(content="not a repair payload"),
+                completion_response(
+                    tool_calls=None,
+                    content="工具未能执行，改用题目条件说明。",
+                ),
+            ]
+        )
+
+        def fallback_tool_answer(
+            question: str,
+            context: str | None = None,
+            mode_instruction: str | None = None,
+        ) -> dict:
+            return answer_with_tools(
+                question,
+                context=context,
+                mode_instruction=mode_instruction,
+                completion_func=completion,
+            )
+
+        result = run_teacher_agent(
+            "电压为 12 V，电阻为 6 Ω，求电流。",
+            rag_policy="off",
+            analyzer_func=FakeAnalyzer(
+                analysis_json(calculation_required=True)
+            ),
+            answer_func=FakeAnswer(),
+            tool_answer_func=fallback_tool_answer,
+        )
+
+        self.assertEqual(result["answer"], "工具未能执行，改用题目条件说明。")
+        self.assertEqual(result["trace"]["status"], "completed_with_fallback")
+        self.assertEqual(result["trace"]["total_model_requests"], 4)
+        result_step = step_by_name(result["trace"], "tool_result_answer")
+        self.assertEqual(result_step["metadata"]["fallback"], "model_only")
+
     def test_image_block_creates_blocked_trace(self) -> None:
         result = run_teacher_agent(
             "请看图回答。",

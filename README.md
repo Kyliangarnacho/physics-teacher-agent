@@ -2,9 +2,9 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 10：在 Stage 09
-的视觉/多图基础上，加入 SQLite 持久会话、多会话管理、最近历史与教学状态，以及长期
-学习记忆的手动提取、确认和召回。当前文本模型为 `qwen3.7-flash`，提示词版本仍为
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 11.1：在 Stage 10
+的持久会话、教学状态与长期记忆基础上，扩展为具备有限多工具编排和公开工具适用性评测的
+本地物理计算 Agent。当前文本模型为 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。
 
 ## 环境与配置
@@ -36,10 +36,11 @@
 - `knowledge/physics_notes_v1.jsonl`：保存 10 条可检索的初中物理知识卡片
 - `src/retriever.py`：使用 `jieba` 分词和 `BM25Okapi` 排序，过滤低相关结果
 - `src/rag.py`：提供纯检索 context/sources 接口，并保持旧 RAG 回答入口兼容
-- `src/tools/physics_calculators.py`：实现五个基于 `Decimal` 的本地物理计算函数
-- `src/tools/schemas.py`：定义五类严格 Pydantic v2 工具参数 Schema
-- `src/tools/registry.py`：显式注册五个白名单工具，校验参数并返回结构化执行记录
-- `src/tool_client.py`：执行单工具、两轮 Qwen Function Calling，并返回工具记录
+- `src/tools/physics_calculators.py`：实现七个基于 `Decimal` 的本地物理计算函数
+- `src/tools/schemas.py`：定义七类严格 Pydantic v2 工具参数 Schema
+- `src/tools/registry.py`：显式注册七个白名单工具，校验参数并返回结构化执行记录
+- `src/tool_client.py`：使用 `tool_choice=auto` 执行有限多工具 Function Calling、一次参数
+  repair、partial success 与安全 Model-only fallback
 - `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并统一记录安全错误类型
 - `src/retry.py`：提供至多重试一次的通用有限 Retry，不负责业务错误分类
 - `src/vision/`：负责图片内存预处理、视觉提取、可选 OCR、结果合并、多图 Batch 与安全上下文
@@ -56,6 +57,9 @@
 - `evaluation/stage08_agent_cases_v1.json`：保存 8 道 Stage 08 代表性 Agent 路径题
 - `evaluation/run_stage08_agent_evaluation.py`：支持 fake/real、筛选与断点续跑的 Agent 评测入口
 - `evaluation/summarize_stage08_results.py`：汇总路由、请求、Retry、RAG、工具和错误统计
+- `evaluation/stage11_tool_selection_cases_v1.json`：24 条公开、可重复的工具适用性评测题
+- `evaluation/run_stage11_tool_selection_evaluation.py`：只评估工具选择的真实模型评测入口
+- `evaluation/results/stage11_tool_selection_comparison.md`：公开策略对比报告
 - `evaluation/reviews/`：保存人工评审表与版本对比
 - `evaluation/validate_stage04_text_cases.py`：校验题目字段、数量和 ID
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit` 和断点续跑的评测入口
@@ -71,6 +75,27 @@ Stage 10 当前实现：
   普通回答、RAG 和 Tool 链路
 - 长期学习记忆：点击“分析本轮学习表现”提取候选，用户确认后才写入；确认后的记忆会
   在相关题目中召回，并可在“学习档案”中停用或删除
+
+## Stage 11.1 有限多工具编排
+
+Stage 11.1 当前实现：
+
+- 本地白名单工具由 5 个扩展为 7 个：新增机械功率 `P=W/t` 与滑轮组效率
+  `η=Gh/(Fs)`；所有数值计算继续使用 `Decimal` 和严格 Pydantic 参数合同。
+- 单次工具选择最多接受 1～5 个 `tool_calls`，严格按模型返回顺序经 Registry 校验并执行；
+  最终模型一次性接收完整 assistant 工具调用与全部 `role=tool` 结果。
+- 单个调用失败不会阻断后续调用；存在任一成功记录时以完整成功/失败记录生成最终回答。
+  若所有调用失败、没有调用或协议超限，则安全回退到不带 tools 的 Model-only 回答。
+- 参数合同错误最多进行 1 轮批量 repair；未知工具、协议错误和本地物理条件错误不修复。
+  已成功的本地工具不会因 repair 或最终回答重试再次执行。
+- Tool Client 使用 `tool_choice=auto`。正式工具选择规则是：仅在现有白名单工具能直接、
+  可靠核算关键数值时主动调用；即使可以心算，也保留有价值的确定性核算；无匹配工具时
+  正常 Model-only；多个独立且均被覆盖的计算可一次返回多个调用。no-tool 是正常决策，
+  不作为协议错误或 repair 触发条件。
+- Trace 记录多工具调用、repair 数量、partial success、Model-only fallback 与实际模型
+  请求数；本地 Registry 执行不计入模型请求。
+- 已建立 24 条公开工具适用性评测。正式规则复测的 precision 为 92.3%、recall 为 80.0%、
+  no-tool 正确率为 83.3%、多工具完整命中率为 100%，并保留 1 次误调用作为当前限制。
 
 ## Stage 09 图片理解与多图聊天
 
@@ -104,13 +129,14 @@ Stage 08 当前实现：
 S08-AGENT-002 被判断为 `explain` 而非预期的 `solve`。这些结果原样保留，没有为提高分数改写
 Prompt、路由规则或工具算法。
 
-## Stage 07 本地工具与统一 Agent
+## Stage 07 本地工具与统一 Agent 基础
 
 Stage 07 当前实现：
 
-- 五个本地工具：`calculate_average_speed`、`calculate_density`、
-  `calculate_ohms_law`、`calculate_electric_power`、`convert_physics_unit`
-- 五类 Pydantic v2 参数 Schema，拒绝额外字段、非法数值和不合法参数组合
+- 工具基础：`calculate_average_speed`、`calculate_density`、`calculate_ohms_law`、
+  `calculate_electric_power`、`convert_physics_unit`；Stage 11.1 已在此基础上增加机械功率
+  和滑轮组效率工具
+- 严格 Pydantic v2 参数 Schema，拒绝额外字段、非法数值和不合法参数组合
 - 显式白名单 Tool Registry，不根据模型字符串动态执行任意函数
 - 仅对已登记数值字段的纯 JSON 数字字符串进行受控规范化
 - Analyzer 输出 `calculation_required`，Router 输出 `use_tools`
@@ -131,14 +157,15 @@ Stage 07 当前实现：
 → RouteDecision
 → 可选 BM25 RAG，统一准备 context 和 sources
 → use_tools=false：普通最终回答模型
-→ use_tools=true：工具选择模型 → 白名单 Registry 本地执行 → role=tool 结果回传模型
+→ use_tools=true：工具选择模型（可选 1～5 个调用）→ 白名单 Registry 本地执行
+  → 全部 role=tool 结果回传模型
 → 页面展示答案、Agent 决策、来源和可选工具记录
 ```
 
 Analyzer 返回非法 JSON、字段不合法或调用异常时不重试，而是使用安全的 `solve`
 分析继续处理，并在最终结果中标记 `analysis_fallback=true`。工具题正常情况下包含三次模型
-请求：Analyzer 一次、Tool Client 工具选择一次、工具结果回传一次；Registry 的计算在本地
-完成，不属于模型请求。
+请求：Analyzer 一次、Tool Client 工具选择一次、工具结果回传一次；一次参数 repair 或可
+重试 API 异常会额外增加请求。Registry 的计算在本地完成，不属于模型请求。
 
 ## Stage 05 最小 RAG
 
@@ -265,7 +292,7 @@ API 配置与费用时执行。
   `content`
 - Stage 05 知识库 10 条卡片通过结构与唯一性校验
 - 检索、RAG 编排和 context 消息均由 fake/mock 测试覆盖，不调用千问
-- 当前全部单元测试为 581 项，全部通过
+- 当前全部单元测试为 608 项，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，页面与终端没有出现应用 traceback
 - 已真实验证电热器和凸透镜 RAG 问答；加入相对分数过滤后再次验证电热器问题，网页来源
   只返回 `KB-POWER-001`
@@ -275,7 +302,7 @@ API 配置与费用时执行。
   Analyzer 和最终回答两次模型调用
 - 教师 Prompt 已加入绝对化前提检查、先勘误再回答和条件变化事实守护；`KB-ELEC-003`
   已补充额定功率定义、相等条件和白炽灯丝电阻随温度变化的边界
-- Stage 07 底层 Function Calling 探针已验证 Qwen 接受五个工具 Schema、返回工具调用并
+- Stage 07 底层 Function Calling 探针已验证 Qwen 接受白名单工具 Schema、返回工具调用并
   接受匹配的 `role=tool` 消息
 - Stage 07 统一 Agent 真实 E2E 使用“12 V、6 Ω 求电流”问题，Analyzer 判断需要计算，
   Router 启用 `calculate_ohms_law`，Registry 本地得到 `2 A`，最终教师回答非空；本次链路
@@ -310,8 +337,9 @@ Stage 08 的 8 道题只覆盖代表性工程路径，不是完整初中物理�
 系统人工物理评分。真实运行的 5/8 路由匹配说明自动分类仍有偏差，当前结果不能证明所有题型
 都能稳定选择预期模式或知识库策略。
 
-本地 SQLite 是单用户设计，没有登录和多用户隔离。工具链仍以单工具单次执行为主，复杂
-多问可能受限；模型偶尔可能生成字符串 `"None"` 等非法工具参数，Registry 会拒绝。
+本地 SQLite 是单用户设计，没有登录和多用户隔离。工具链每批最多执行 5 个调用，不支持
+多轮工具规划、任意参数猜测或无限 repair；模型偶尔可能生成字符串 `"None"` 等非法工具
+参数，Registry 会拒绝。
 长期记忆检索目前是关键词确定性近似。未确认候选只存在 `session_state`；暂无重新启用
 长期记忆的页面操作；V1 没有单独持久化 assistant 的 analysis 字段。
 图片理解依赖视觉模型输出，模糊文字、手写内容和复杂图形仍可能需要人工确认；一次提交最多

@@ -180,6 +180,7 @@ class StepTimerTests(unittest.TestCase):
                 "tool_selection_api",
                 "tool_protocol",
                 "tool_validation",
+                "tool_repair_api",
                 "tool_execution",
                 "tool_result_api",
                 "final_answer_api",

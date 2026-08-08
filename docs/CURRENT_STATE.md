@@ -1,10 +1,11 @@
 # 当前状态
 
-## Stage 10 状态
+## Stage 11.1 状态
 
 “初中物理教师 Agent + 阿里云百炼千问 API”当前使用 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。Stage 10 在 Stage 09 视觉/多图基础上加入 SQLite 持久会话、
-多会话管理、最近历史与教学状态，以及长期学习记忆的手动提取、确认和召回。
+多会话管理、最近历史与教学状态，以及长期学习记忆的手动提取、确认和召回；Stage 11.1
+进一步加入有限多工具编排、参数 repair、Model-only fallback 和公开工具选择评测。
 
 当前个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心。幽默仅在语境自然匹配时
 偶尔出现，不要求每题都有。
@@ -23,11 +24,12 @@
 - `knowledge/physics_notes_v1.jsonl`：10 条初中物理知识卡片
 - `src/retriever.py`：使用 `jieba` 和 `rank_bm25.BM25Okapi` 建立本地文本索引
 - `src/rag.py`：提供纯检索 context/sources 接口，并保留原 RAG 回答入口
-- `src/tools/physics_calculators.py`：五个基于 `Decimal` 的确定性本地计算函数
-- `src/tools/schemas.py`：五类严格 Pydantic v2 工具参数合同
-- `src/tools/registry.py`：五工具白名单、数值字符串规范化、参数校验和结构化执行记录
-- `src/tool_client.py`：单工具两轮 Function Calling，并记录选择、执行、结果回答三个步骤；
-  API 调用可有限重试且不会重复执行成功的本地工具
+- `src/tools/physics_calculators.py`：七个基于 `Decimal` 的确定性本地计算函数
+- `src/tools/schemas.py`：七类严格 Pydantic v2 工具参数合同
+- `src/tools/registry.py`：七工具白名单、数值字符串规范化、参数校验和结构化执行记录
+- `src/tool_client.py`：以 `tool_choice=auto` 进行有限多工具 Function Calling，支持 1～5 个
+  调用的顺序执行、partial success、一次参数 repair 与 Model-only fallback；API 调用可有限
+  重试且不会重复执行已成功的本地工具
 - `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并定义统一安全错误类别
 - `src/retry.py`：提供至多重试一次的通用有限 Retry
 - `src/vision/`：图片预处理、视觉/OCR Client、结果合并、安全上下文及多图 Batch
@@ -48,6 +50,9 @@
 - `evaluation/stage08_agent_cases_v1.json`：8 道代表性 Agent 路径题
 - `evaluation/run_stage08_agent_evaluation.py`：支持 fake/real、筛选和断点续跑的评测入口
 - `evaluation/summarize_stage08_results.py`：汇总路由、请求、Retry、RAG、工具和错误统计
+- `evaluation/stage11_tool_selection_cases_v1.json`：24 条公开工具适用性评测题
+- `evaluation/run_stage11_tool_selection_evaluation.py`：真实但只评估工具选择的专项 Runner
+- `evaluation/results/stage11_tool_selection_comparison.md`：公开策略对比结果
 - `evaluation/reviews/`：人工评审表和新旧版本对比
 - `evaluation/validate_stage04_text_cases.py`：评测数据校验入口
 - `evaluation/run_stage04_text_evaluation.py`：支持 `--limit`、独立输出文件和断点续跑
@@ -110,8 +115,8 @@ Stage 08 Runner 默认为 fake 模式；`--mode real` 才会调用当前 Agent �
 → 可选 RAG，统一准备 context 和 sources
 → 普通路径：最终回答模型
 → RAG 路径：context + 最终回答模型
-→ Tool 路径：工具选择模型 → Registry 本地执行 → role=tool 结果回传模型
-→ RAG+Tool 路径：同一次检索 context → 工具选择、本地执行和结果回传
+→ Tool 路径：工具选择模型（可选 1～5 个调用）→ Registry 顺序执行 → 全部 role=tool 结果回传
+→ RAG+Tool 路径：同一次检索 context → 有限多工具选择、本地执行和结果回传
 → 汇总步骤 Trace 与 AgentRunTrace
 → 页面展示答案、决策、来源、可选工具记录和运行轨迹
 ```
@@ -133,16 +138,23 @@ Stage 08 Runner 默认为 fake 模式；`--mode real` 才会调用当前 Agent �
 
 Analyzer、工具选择和工具结果回答的 API 调用异常最多重试一次；JSON 解析、Schema、协议、
 参数校验和本地工具错误不重试。工具结果回答重试复用同一份工具记录，不再次执行本地工具。
-每次 Agent 运行汇总总模型请求数、RAG 检索数、本地工具执行数以及各步骤状态和安全错误摘要。
+每次 Agent 运行汇总总模型请求数、RAG 检索数、本地工具执行数以及各步骤状态和安全错误摘要；
+Trace 还记录 repair、partial success 与 Model-only fallback。
 
 Analyzer 的 `calculation_required=true` 且条件完整时，Router 设置 `use_tools=true`。
-五个白名单工具分别计算平均速度、密度、欧姆定律、电功率和物理单位换算。工具参数先经
-对应 Pydantic Schema 校验；Qwen 返回的纯 JSON 数字字符串只在已登记数值字段中受控
-转换，其余字符串、额外字段和非法参数不会被猜测执行。
+七个白名单工具分别计算平均速度、密度、欧姆定律、电功率、单位换算、机械功率和滑轮组效率。
+工具选择使用 `tool_choice=auto`：只有白名单工具能直接、可靠核算关键数值时才主动调用；
+即使可心算也保留有价值的确定性核算；无匹配工具时正常 Model-only，no-tool 不视为错误。
+多个独立且被覆盖的计算可一次返回多个调用。工具参数先经对应 Pydantic Schema 校验；Qwen
+返回的纯 JSON 数字字符串只在已登记数值字段中受控转换，其余字符串、额外字段和非法参数
+不会被猜测执行。
 
-普通、RAG、Tool、RAG+Tool 四条路径共用 `run_teacher_agent()`。非工具题通常包含
-Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、工具选择、工具结果回传三次
-模型请求。Registry 的参数校验和物理计算完全在本地执行，不属于模型请求。
+普通、RAG、Tool、RAG+Tool 四条路径共用 `run_teacher_agent()`。单个 Tool Batch 最多执行
+5 个调用，按模型顺序运行；部分调用失败时保留全部记录，存在任一成功记录仍可生成最终答案。
+参数合同错误最多进行 1 次批量 repair；全失败、无调用或协议超限时回退 Model-only。
+非工具题通常包含 Analyzer 和最终回答两次模型请求；工具题通常包含 Analyzer、工具选择、
+工具结果回传三次模型请求，repair 或有限 Retry 会增加请求。Registry 的参数校验和物理计算
+完全在本地执行，不属于模型请求。
 
 ## 会话与持久化
 
@@ -181,7 +193,7 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
 - BM25 默认 `top_k=3`、`min_score_ratio=0.3`
 - 检索器固定查询能够命中对应电路、凸透镜和电热器卡片
 - context 注入、无来源回退、sources 顺序和精简字段均有 mock/fake 测试
-- 当前共有 581 项单元测试，全部通过
+- 当前共有 608 项单元测试，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，并真实验证电热器、凸透镜 RAG 问答
 - 加入相对分数过滤后再次验证电热器问题，网页来源只返回 `KB-POWER-001`
 - 页面与终端验证过程中没有出现应用 traceback
@@ -192,7 +204,7 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
 - 教师 Prompt 已加入绝对化前提检查、先勘误再回答及条件变化事实守护
 - `KB-ELEC-003` 已补充额定功率定义、额定条件下实际功率相等及白炽灯丝电阻随温度
   变化的说明
-- Stage 07 Function Calling 探针已确认当前 Qwen 接受五个工具定义、返回工具调用，并
+- Stage 07 Function Calling 探针已确认当前 Qwen 接受白名单工具定义、返回工具调用，并
   接受匹配的 `role=tool` 消息
 - Stage 07 统一 Agent 真实 E2E 使用“12 V、6 Ω 求电流”问题：Analyzer 判断
   `calculation_required=true`，Router 设置 `use_tools=true`、`use_rag=false`，
@@ -212,6 +224,11 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
   均有本地测试覆盖；全量回归 581/581
 - Stage 10 真实探针验证：两轮会话 hint_step 递增、记忆确认后写入且停用后不再召回；
   Streamlit HTTP 200 且无 traceback
+- Stage 11.1 新增机械功率和滑轮组效率工具；Registry、参数 Schema 与计算函数均由专项测试覆盖
+- Stage 11.1 支持 1～5 个工具调用的顺序执行、partial success、一次有限参数 repair 和
+  Model-only fallback；已成功工具不会因 repair 或最终回答重试重复执行
+- 已建立 24 条公开工具适用性评测；正式 Tool Selection 规则复测为 precision 92.3%、
+  recall 80.0%、no-tool 正确率 83.3%、多工具完整命中率 100%，保留 1 次误调用作为限制
 
 用户已手动验证：
 
@@ -226,24 +243,20 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
 正确性。当前没有向量检索、重排序、系统化召回评测或自动事实校验；真实网页验收目前只
 覆盖普通问答、电热器和凸透镜等少量问题，不能代表完整 RAG 效果。
 
-非工具题的自动模式通常进行 Analyzer 和最终回答两次模型调用；工具题通常需要三次模型
-调用，会增加延迟与费用；有限 Retry 在可重试 API 异常时还会增加一次请求。Analyzer 仍可能
+非工具题的自动模式通常进行 Analyzer 和最终回答两次模型调用；工具题通常需要 Analyzer、
+工具选择和结果回传三次模型调用，会增加延迟与费用；repair 或有限 Retry 在相应场景还会
+增加一次请求。Analyzer 仍可能
 错误判断题型、RAG 或计算需求；Schema、Router 和 Registry 能校验结构、路由与确定性计算
 参数，但不能验证复杂题目的物理建模是否正确，模型仍可能遗漏预期细节。
 
 Stage 08 的 8 道题是工程路径小样本，未对全部回答进行系统人工物理评分，不能代表完整初中
 物理能力。真实评测只有 5/8 路由与人工预期一致，说明自动模式与知识库策略仍可能偏离预期。
 
-本地 SQLite 是单用户设计，没有登录和多用户隔离。工具链仍以单工具单次执行为主，复杂
-多问可能受限；模型偶尔可能生成字符串 `"None"` 等非法工具参数，Registry 会拒绝。
+本地 SQLite 是单用户设计，没有登录和多用户隔离。工具链每批最多执行 5 个调用，不支持
+多轮工具规划、无限 repair、任意参数猜测或基于工具结果再规划新工具；复杂多问仍可能受限。
+模型偶尔可能生成字符串 `"None"` 等非法工具参数，Registry 会拒绝。
 长期记忆检索目前是关键词确定性近似。未确认候选只存在 `session_state`；暂无重新启用
 长期记忆的页面操作；V1 没有单独持久化 assistant 的 analysis 字段。
 图片理解仍可能受清晰度、手写内容和复杂图形影响；一次最多处理 3 张图片，OCR 只有在本地
 配置可用模型时才启用，不确定结果仍需人工确认。知识库仍只有 10 条卡片；尚未实现向量检索、
 MCP、微调或通用跨图片语义推理。
-
-## 本地评测参考题库
-
-`data/raw/原始题库 Word/精品解析：2025年广东省广州市天河区中考一模物理试题（解析版）.docx`
-仅作为本地测试参考（如第 13 题机械能、第 15 题多挡电路场景）。该目录被 Git 忽略，
-不复制试卷全文或解析进仓库。

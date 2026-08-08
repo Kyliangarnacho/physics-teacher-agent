@@ -97,6 +97,19 @@ def _recoverable_image_tool_error(tool_result: dict[str, Any]) -> str | None:
     return None
 
 
+def _used_model_only_tool_fallback(tool_result: dict[str, Any]) -> bool:
+    """Return whether Tool Client completed through its safe model-only fallback."""
+    traces = tool_result.get("step_traces")
+    if not isinstance(traces, list):
+        return False
+    return any(
+        isinstance(trace, dict)
+        and isinstance(trace.get("metadata"), dict)
+        and trace["metadata"].get("fallback") == "model_only"
+        for trace in traces
+    )
+
+
 def _tool_traces_from_result(tool_result: dict[str, Any]) -> list[StepTrace]:
     """Load Tool Client traces while keeping older injected fakes compatible."""
     trace_data = tool_result.get("step_traces")
@@ -340,10 +353,17 @@ def run_teacher_agent(
             for tool_trace in _tool_traces_from_result(tool_result):
                 trace_builder.add_step(tool_trace)
             recoverable_tool_error = _recoverable_image_tool_error(tool_result)
-            tool_fallback = bool(
-                image_context_available and recoverable_tool_error is not None
+            model_only_tool_fallback = _used_model_only_tool_fallback(
+                tool_result
             )
-            if tool_fallback:
+            tool_fallback = bool(
+                model_only_tool_fallback
+                or (
+                    image_context_available
+                    and recoverable_tool_error is not None
+                )
+            )
+            if image_context_available and recoverable_tool_error is not None:
                 fallback_timer = StepTimer("final_answer")
                 answer = _invoke_with_context(
                     active_answer_func,

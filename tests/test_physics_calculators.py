@@ -10,7 +10,9 @@ from src.tools.physics_calculators import (
     calculate_average_speed,
     calculate_density,
     calculate_electric_power,
+    calculate_mechanical_power,
     calculate_ohms_law,
+    calculate_pulley_efficiency,
     convert_physics_unit,
 )
 
@@ -59,6 +61,58 @@ class DensityTests(unittest.TestCase):
     def test_rejects_negative_mass(self) -> None:
         with self.assertRaisesRegex(ValueError, "质量不得为负数"):
             calculate_density(-1, 1)
+
+
+class MechanicalPowerTests(unittest.TestCase):
+    def test_calculates_mechanical_power(self) -> None:
+        result = calculate_mechanical_power("120.0", 10)
+
+        self.assertEqual(result["formula"], "P = W / t")
+        self.assertEqual(result["raw_result"], "12.0")
+        self.assertEqual(result["display_value"], "12")
+        self.assertEqual(result["unit"], "W")
+
+    def test_allows_zero_work_but_rejects_negative_work_and_nonpositive_time(self) -> None:
+        self.assertEqual(calculate_mechanical_power(0, 2)["display_value"], "0")
+        with self.assertRaisesRegex(ValueError, "功不得为负数"):
+            calculate_mechanical_power(-1, 2)
+        for time in (0, -1):
+            with self.subTest(time=time):
+                with self.assertRaisesRegex(ValueError, "时间必须大于 0"):
+                    calculate_mechanical_power(10, time)
+
+
+class PulleyEfficiencyTests(unittest.TestCase):
+    def test_calculates_efficiency_from_explicit_work_data(self) -> None:
+        result = calculate_pulley_efficiency(
+            weight_n=100,
+            height_m=2,
+            force_n=50,
+            distance_m=5,
+        )
+
+        self.assertEqual(result["formula"], "η = Gh / (F × s) × 100%")
+        self.assertEqual(result["display_value"], "80")
+        self.assertEqual(result["unit"], "%")
+
+    def test_allows_100_percent_but_rejects_higher_efficiency(self) -> None:
+        self.assertEqual(
+            calculate_pulley_efficiency(100, 2, 40, 5)["display_value"],
+            "100",
+        )
+        with self.assertRaisesRegex(ValueError, "超过 100%"):
+            calculate_pulley_efficiency(100, 2, 30, 5)
+
+    def test_rejects_invalid_work_conditions_without_deriving_distance(self) -> None:
+        for arguments in (
+            {"weight_n": -1, "height_m": 1, "force_n": 1, "distance_m": 1},
+            {"weight_n": 1, "height_m": -1, "force_n": 1, "distance_m": 1},
+            {"weight_n": 1, "height_m": 1, "force_n": 0, "distance_m": 1},
+            {"weight_n": 1, "height_m": 1, "force_n": 1, "distance_m": 0},
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    calculate_pulley_efficiency(**arguments)
 
 
 class OhmsLawTests(unittest.TestCase):

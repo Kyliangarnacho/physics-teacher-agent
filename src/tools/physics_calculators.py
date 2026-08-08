@@ -105,6 +105,44 @@ def calculate_density(mass_kg: Any, volume_m3: Any) -> CalculationResult:
     return _build_result("ρ = m / V", mass / volume, "kg/m³")
 
 
+def calculate_mechanical_power(work_j: Any, time_s: Any) -> CalculationResult:
+    """根据功和时间计算机械功率，单位为 W。"""
+    work = _to_decimal(work_j, "功")
+    time = _to_decimal(time_s, "时间")
+    _require_non_negative(work, "功")
+    if time <= 0:
+        raise ValueError("时间必须大于 0。")
+    return _build_result("P = W / t", work / time, "W")
+
+
+def calculate_pulley_efficiency(
+    weight_n: Any,
+    height_m: Any,
+    force_n: Any,
+    distance_m: Any,
+) -> CalculationResult:
+    """按已给定的有用功与总功计算滑轮效率，不推导绳端移动距离。"""
+    weight = _to_decimal(weight_n, "物重")
+    height = _to_decimal(height_m, "提升高度")
+    force = _to_decimal(force_n, "拉力")
+    distance = _to_decimal(distance_m, "绳端移动距离")
+    _require_non_negative(weight, "物重")
+    _require_non_negative(height, "提升高度")
+    if force <= 0:
+        raise ValueError("拉力必须大于 0。")
+    if distance <= 0:
+        raise ValueError("绳端移动距离必须大于 0。")
+
+    efficiency_ratio = weight * height / (force * distance)
+    if efficiency_ratio > Decimal("1"):
+        raise ValueError("滑轮效率超过 100%，请检查物理条件。")
+    return _build_result(
+        "η = Gh / (F × s) × 100%",
+        efficiency_ratio * Decimal("100"),
+        "%",
+    )
+
+
 def calculate_ohms_law(
     voltage_v: Any = None,
     current_a: Any = None,

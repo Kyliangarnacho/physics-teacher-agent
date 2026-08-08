@@ -33,6 +33,7 @@ class ErrorType(str, Enum):
     TOOL_SELECTION_API = "tool_selection_api"
     TOOL_PROTOCOL = "tool_protocol"
     TOOL_VALIDATION = "tool_validation"
+    TOOL_REPAIR_API = "tool_repair_api"
     TOOL_EXECUTION = "tool_execution"
     TOOL_RESULT_API = "tool_result_api"
     FINAL_ANSWER_API = "final_answer_api"

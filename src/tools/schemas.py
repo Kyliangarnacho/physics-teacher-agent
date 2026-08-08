@@ -111,6 +111,22 @@ class DensityParameters(_ToolParameters):
     volume_m3: PositiveNumber
 
 
+class MechanicalPowerParameters(_ToolParameters):
+    """Parameters for mechanical-power calculation."""
+
+    work_j: NonNegativeNumber
+    time_s: PositiveNumber
+
+
+class PulleyEfficiencyParameters(_ToolParameters):
+    """Parameters for pulley efficiency from explicitly supplied work data."""
+
+    weight_n: NonNegativeNumber
+    height_m: NonNegativeNumber
+    force_n: PositiveNumber
+    distance_m: PositiveNumber
+
+
 class OhmsLawParameters(_ToolParameters):
     """Exactly two known quantities for Ohm's law."""
 
