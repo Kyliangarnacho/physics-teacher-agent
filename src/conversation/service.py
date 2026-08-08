@@ -82,6 +82,7 @@ def _build_agent_run(
         "sources_json": agent_result.get("sources", []),
         "tool_records_json": agent_result.get("tool_records", []),
         "trace_json": agent_result.get("trace"),
+        "analysis_json": agent_result.get("analysis", {}),
     }
 
 

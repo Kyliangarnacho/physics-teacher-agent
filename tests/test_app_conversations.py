@@ -394,6 +394,12 @@ class AppConversationTests(unittest.TestCase):
                         "result": {"display_value": "2", "unit": "A"},
                     }
                 ],
+                "analysis_json": {
+                    "physics_topic": "电学",
+                    "question_type": "计算题",
+                    "calculation_required": True,
+                    "short_reason": "需要计算电流。",
+                },
                 "trace_json": {
                     "run_id": "run-restore",
                     "status": "completed_with_fallback",
@@ -409,7 +415,21 @@ class AppConversationTests(unittest.TestCase):
                             "attempts": 1,
                             "duration_ms": 1,
                             "model_requests": 1,
-                        }
+                        },
+                        {
+                            "name": "tool_selection",
+                            "status": "success",
+                            "attempts": 1,
+                            "duration_ms": 1,
+                            "model_requests": 1,
+                        },
+                        {
+                            "name": "tool_result_answer",
+                            "status": "success",
+                            "attempts": 1,
+                            "duration_ms": 1,
+                            "model_requests": 1,
+                        },
                     ],
                 },
             },
@@ -427,6 +447,10 @@ class AppConversationTests(unittest.TestCase):
         self.assertIn("run-restore", rendered)
         self.assertIn("calculate_ohms_law", rendered)
         self.assertIn("2 A", rendered)
+        self.assertIn("电学", rendered)
+        self.assertIn("需要计算电流", rendered)
+        captions = "\n".join(str(item.value) for item in app.caption)
+        self.assertIn("Tool Client 内部模型请求数：2", captions)
 
 
 if __name__ == "__main__":

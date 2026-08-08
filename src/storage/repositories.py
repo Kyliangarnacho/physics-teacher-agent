@@ -52,6 +52,7 @@ _AGENT_RUN_COLUMNS = (
     "sources_json",
     "tool_records_json",
     "trace_json",
+    "analysis_json",
     "created_at",
 )
 _CONVERSATION_STATE_COLUMNS = (
@@ -131,7 +132,12 @@ def _message_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _agent_run_from_row(row: sqlite3.Row) -> dict[str, Any]:
     data = _row_to_dict(row)
-    for name in ("sources_json", "tool_records_json", "trace_json"):
+    for name in (
+        "sources_json",
+        "tool_records_json",
+        "trace_json",
+        "analysis_json",
+    ):
         data[name] = _json_loads(data[name])
     return data
 
@@ -353,6 +359,7 @@ def _prepare_agent_run(
         sources_json = _json_dumps(run.get("sources_json"))
         tool_records_json = _json_dumps(run.get("tool_records_json"))
         trace_json = _json_dumps(run.get("trace_json"))
+        analysis_json = _json_dumps(run.get("analysis_json"))
     except ValueError as exc:
         raise ValueError(
             "AgentRun 的 JSON 字段必须是 dict、list 或 JSON 字符串。"
@@ -376,6 +383,7 @@ def _prepare_agent_run(
         "sources_json": sources_json,
         "tool_records_json": tool_records_json,
         "trace_json": trace_json,
+        "analysis_json": analysis_json,
         "created_at": run.get("created_at") or now,
     }
 
@@ -389,7 +397,7 @@ def _insert_agent_run_on_conn(
         "(run_id, conversation_id, user_message_id, assistant_message_id, "
         "status, teaching_mode, use_rag, use_tools, total_model_requests, "
         "total_duration_ms, sources_json, tool_records_json, trace_json, "
-        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "analysis_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             prepared["run_id"],
             prepared["conversation_id"],
@@ -404,6 +412,7 @@ def _insert_agent_run_on_conn(
             prepared["sources_json"],
             prepared["tool_records_json"],
             prepared["trace_json"],
+            prepared["analysis_json"],
             prepared["created_at"],
         ),
     )
@@ -528,6 +537,7 @@ def insert_agent_run(
         "sources_json": run.get("sources_json"),
         "tool_records_json": run.get("tool_records_json"),
         "trace_json": run.get("trace_json"),
+        "analysis_json": run.get("analysis_json"),
         "created_at": prepared["created_at"],
     }
 
@@ -544,7 +554,7 @@ def get_agent_runs(
                 "SELECT run_id, conversation_id, user_message_id, assistant_message_id, "
                 "status, teaching_mode, use_rag, use_tools, total_model_requests, "
                 "total_duration_ms, sources_json, tool_records_json, trace_json, "
-                "created_at FROM agent_runs "
+                "analysis_json, created_at FROM agent_runs "
                 "WHERE conversation_id = ? "
                 "ORDER BY created_at ASC, rowid ASC",
                 (conversation_id,),

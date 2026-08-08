@@ -1,7 +1,8 @@
 """SQLite Schema 迁移：使用 ``PRAGMA user_version`` 管理版本并保证原子性。
 
-当前 schema 版本为 1（Stage 10 V1），创建会话、消息、Agent 运行、会话状态与
-长期记忆五张表。字段名是后续 Repository 与 Conversation Service 的数据合同，
+当前 schema 版本为 2，创建会话、消息、Agent 运行、会话状态与长期记忆五张表。
+Agent 运行额外保存安全的 Analyzer 分析摘要，供历史恢复决策展示。字段名是后续
+Repository 与 Conversation Service 的数据合同，
 不得自行改名或用 JSON 大字段替代明确字段。每个版本在一个显式事务中应用，
 成功时写入 ``user_version``，失败时整体回滚，不留下半成品结构。
 """
@@ -12,7 +13,7 @@ import sqlite3
 from collections.abc import Sequence
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 _SCHEMA_MIGRATIONS: dict[int, Sequence[str]] = {
@@ -108,6 +109,9 @@ _SCHEMA_MIGRATIONS: dict[int, Sequence[str]] = {
         CREATE INDEX idx_learning_memories_source_conversation_id
             ON learning_memories(source_conversation_id)
         """,
+    ),
+    2: (
+        "ALTER TABLE agent_runs ADD COLUMN analysis_json TEXT",
     ),
 }
 

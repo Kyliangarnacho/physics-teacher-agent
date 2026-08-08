@@ -111,7 +111,7 @@ APP_STYLES = """
     width: min(100%, 650px);
     margin-inline: auto;
     border: 1px solid #dedede;
-    border-radius: 999px !important;
+    border-radius: 1.35rem !important;
     background: #ffffff;
     box-shadow: 0 6px 24px rgb(0 0 0 / 7%);
     overflow: hidden;
@@ -119,12 +119,22 @@ APP_STYLES = """
 
 [data-testid="stChatInput"] > div,
 [data-testid="stChatInput"] textarea {
-    border-radius: 999px !important;
     background: #ffffff;
 }
 
+[data-testid="stChatInput"] > div {
+    border-radius: inherit !important;
+    align-items: flex-end;
+}
+
 [data-testid="stChatInput"] textarea {
-    padding-left: 0.35rem;
+    border-radius: 0 !important;
+    min-height: 1.5rem !important;
+    max-height: 8rem !important;
+    padding: 0.65rem 0.35rem;
+    line-height: 1.5;
+    overflow-y: auto !important;
+    resize: none !important;
 }
 
 [data-testid="stChatInput"]:focus-within {
@@ -842,6 +852,29 @@ def render_chat_message(message: dict[str, object], message_index: int) -> None:
                 render_memory_analysis(message)
 
 
+def _tool_model_requests_from_trace(
+    trace: dict[str, object],
+    *,
+    legacy_value: int = 0,
+) -> int:
+    """汇总 Tool Client 请求；无步骤的旧记录保留其已存数量。"""
+    steps = trace.get("steps")
+    if not isinstance(steps, list):
+        return 0
+    total = 0
+    found_tool_step = False
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if step.get("name") not in {"tool_selection", "tool_result_answer"}:
+            continue
+        found_tool_step = True
+        requests = step.get("model_requests", 0)
+        if isinstance(requests, int) and not isinstance(requests, bool):
+            total += max(requests, 0)
+    return total if found_tool_step else max(legacy_value, 0)
+
+
 def _assistant_render_dict(
     message: dict[str, object],
     run_by_assistant_id: dict[str, dict[str, object]],
@@ -854,21 +887,31 @@ def _assistant_render_dict(
     trace = run.get("trace_json")
     if not isinstance(trace, dict):
         trace = {}
+    analysis = run.get("analysis_json")
+    if not isinstance(analysis, dict):
+        analysis = None
     display_trace = trace if trace else None
     return {
         "role": "assistant",
         "content": message.get("display_content") or "",
         "sources": run.get("sources_json") or [],
-        "analysis": None,
+        "analysis": analysis,
         "route": {
             "teaching_mode": run.get("teaching_mode"),
             "use_rag": bool(run.get("use_rag")),
             "use_tools": bool(run.get("use_tools")),
-            "should_answer": True,
+            "should_answer": trace.get("status") != "blocked",
         },
         "analysis_fallback": bool(trace.get("analysis_fallback", False)),
         "tool_records": run.get("tool_records_json") or [],
-        "tool_model_requests": int(trace.get("total_model_requests", 0) or 0),
+        "tool_model_requests": _tool_model_requests_from_trace(
+            trace,
+            legacy_value=(
+                int(run.get("total_model_requests", 0) or 0)
+                if run.get("tool_records_json")
+                else 0
+            ),
+        ),
         "trace": display_trace,
         "_conversation_id": message.get("conversation_id"),
         "_assistant_message_id": message.get("id"),
@@ -1267,6 +1310,7 @@ is_empty_state = (
     and st.session_state.get("pending_submission") is None
 )
 response_slot = None
+provisional_user_rendered = False
 
 if is_empty_state:
     with st.container(key="empty_state"):
@@ -1277,6 +1321,15 @@ else:
     for message_index, message in enumerate(render_messages):
         render_chat_message(message, message_index)
 
+    if submission_to_process is not None:
+        render_chat_message(
+            {
+                "role": "user",
+                "content": str(submission_to_process["question"]),
+            },
+            len(render_messages),
+        )
+        provisional_user_rendered = True
     response_slot = st.empty()
 
 if st.session_state.get("last_turn_error"):
@@ -1310,20 +1363,21 @@ if submission_to_process is not None:
     images = submission_to_process["images"]
     if images:
         try:
-            with st.status(
-                f"正在读取 {len(images)} 张题图",
-                expanded=False,
-            ) as image_status:
-                batch = process_image_batch(
-                    images,
-                    mode=vision_mode,
-                    user_instruction=vision_instruction,
-                    cache=st.session_state.vision_batch_cache,
-                    progress_func=lambda index, total: st.write(
-                        f"正在识别图片 {index}/{total}"
-                    ),
-                )
-                image_status.update(label="题图识别完成", state="complete")
+            with response_slot.container():
+                with st.status(
+                    f"正在读取 {len(images)} 张题图",
+                    expanded=False,
+                ) as image_status:
+                    batch = process_image_batch(
+                        images,
+                        mode=vision_mode,
+                        user_instruction=vision_instruction,
+                        cache=st.session_state.vision_batch_cache,
+                        progress_func=lambda index, total: st.write(
+                            f"正在识别图片 {index}/{total}"
+                        ),
+                    )
+                    image_status.update(label="题图识别完成", state="complete")
         except Exception:
             if response_slot is not None:
                 with response_slot.container():
@@ -1343,7 +1397,8 @@ if submission_to_process is not None:
                     with response_slot.container():
                         render_pending_confirmation()
             else:
-                render_batch_details(batch)
+                with response_slot.container():
+                    render_batch_details(batch)
                 agent_payload = {
                     "question": question,
                     "batch": batch,
@@ -1367,20 +1422,27 @@ if agent_payload is not None:
     image_metadata = agent_payload.get("image_metadata")
     st.session_state.pop("last_turn_error", None)
     try:
-        with st.spinner("正在生成讲解……"):
-            run_conversation_turn(
-                current_conversation_id,
-                display_question=question,
-                model_question=question,
-                image_metadata=image_metadata,
-                confirmed_image_context=(
-                    image_context
-                    if isinstance(image_context, str) and image_context.strip()
-                    else None
-                ),
-                mode_override=mode_override_for_question,
-                rag_policy=rag_policy_for_question,
-            )
+        with response_slot.container():
+            if not provisional_user_rendered:
+                render_chat_message(
+                    {"role": "user", "content": question},
+                    len(render_messages),
+                )
+            with st.status("正在生成讲解……", expanded=False) as answer_status:
+                run_conversation_turn(
+                    current_conversation_id,
+                    display_question=question,
+                    model_question=question,
+                    image_metadata=image_metadata,
+                    confirmed_image_context=(
+                        image_context
+                        if isinstance(image_context, str) and image_context.strip()
+                        else None
+                    ),
+                    mode_override=mode_override_for_question,
+                    rag_policy=rag_policy_for_question,
+                )
+                answer_status.update(label="讲解生成完成", state="complete")
     except ConversationServiceError:
         st.session_state.last_turn_error = "回答生成失败，请稍后重试。"
         st.rerun()

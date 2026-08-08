@@ -332,6 +332,10 @@ class AgentRunRepositoryTests(RepositoryTestCase):
                     "run_id": "run-x",
                     "steps": [{"name": "analyzer", "状态": "成功"}],
                 },
+                "analysis_json": {
+                    "physics_topic": "电学",
+                    "question_type": "计算题",
+                },
             },
             path=self.db_path,
         )
@@ -352,6 +356,7 @@ class AgentRunRepositoryTests(RepositoryTestCase):
             "calculate_ohms_law",
         )
         self.assertEqual(stored["trace_json"]["steps"][0]["状态"], "成功")
+        self.assertEqual(stored["analysis_json"]["physics_topic"], "电学")
 
     def test_insert_agent_run_missing_conversation_raises(self) -> None:
         with self.assertRaises(RepositoryError):

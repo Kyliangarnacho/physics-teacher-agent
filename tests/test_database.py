@@ -66,6 +66,7 @@ EXPECTED_COLUMNS = {
         "sources_json": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
         "tool_records_json": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
         "trace_json": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
+        "analysis_json": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
         "created_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
     },
     "conversation_states": {
@@ -265,14 +266,14 @@ class DatabaseMigrationTests(unittest.TestCase):
         self.addCleanup(self._temp_dir.cleanup)
         self.db_path = str(Path(self._temp_dir.name) / "physics_teacher.db")
 
-    def test_fresh_database_initializes_to_user_version_1(self) -> None:
+    def test_fresh_database_initializes_to_current_user_version(self) -> None:
         returned_path = initialize_database(self.db_path)
 
         self.assertEqual(returned_path, self.db_path)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 1)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 2)
         conn = connect_database(self.db_path)
         try:
-            self.assertEqual(migrations.get_user_version(conn), 1)
+            self.assertEqual(migrations.get_user_version(conn), 2)
         finally:
             conn.close()
 
@@ -510,7 +511,7 @@ class DatabaseMigrationTests(unittest.TestCase):
 
         conn = connect_database(self.db_path)
         try:
-            self.assertEqual(migrations.get_user_version(conn), 1)
+            self.assertEqual(migrations.get_user_version(conn), 2)
             self.assertEqual(table_names(conn), EXPECTED_TABLES)
         finally:
             conn.close()
@@ -531,8 +532,19 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(migrations.get_user_version(conn), 0)
             self.assertNotIn("partial_table", table_names(conn))
 
-            self.assertEqual(migrations.migrate_database(conn), 1)
+            self.assertEqual(migrations.migrate_database(conn), 2)
             self.assertEqual(table_names(conn), EXPECTED_TABLES)
+        finally:
+            conn.close()
+
+    def test_version_1_database_migrates_to_analysis_summary_column(self) -> None:
+        conn = connect_database(self.db_path)
+        try:
+            migrations.apply_migration(conn, 1, migrations._SCHEMA_MIGRATIONS[1])
+            self.assertEqual(migrations.get_user_version(conn), 1)
+
+            self.assertEqual(migrations.migrate_database(conn), 2)
+            self.assertIn("analysis_json", table_info(conn, "agent_runs"))
         finally:
             conn.close()
 
