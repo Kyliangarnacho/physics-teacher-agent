@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
+import streamlit as st
 
 from src.memory import normalize_memory_content
 from src.memory.retrieval import retrieve_relevant_memories
@@ -19,6 +20,7 @@ from src.storage import (
     insert_or_merge_memory,
     list_memories,
 )
+from tests.app_task_manager import ImmediateGenerationTaskManager
 
 
 def fake_agent_result(
@@ -77,6 +79,14 @@ def extractor_fake(payloads):
 
 class AppMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
+        st.cache_resource.clear()
+        self._manager_patch = patch(
+            "src.tasks.GenerationTaskManager",
+            ImmediateGenerationTaskManager,
+        )
+        self._manager_patch.start()
+        self.addCleanup(self._manager_patch.stop)
+        self.addCleanup(st.cache_resource.clear)
         self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self.db_path = str(Path(self._temp_dir.name) / "physics_teacher.db")
@@ -130,6 +140,10 @@ class AppMemoryTests(unittest.TestCase):
                 if item.key.startswith("analyze_memory_")
             )
             analyze.click().run()
+            for _ in range(20):
+                if self.has_button(app, "confirm_memory_"):
+                    break
+                app.run()
 
     def test_normal_answer_shows_analyze_button(self) -> None:
         with self.agent_patch():

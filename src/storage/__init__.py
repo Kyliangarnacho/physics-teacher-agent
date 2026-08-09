@@ -1,7 +1,7 @@
-"""Stage 10 本地 SQLite 存储层。
+"""本地 SQLite 存储层。
 
-当前提供数据库路径解析、短生命周期连接、Schema Migration V1 与 Repository
-数据访问层；Conversation Service 与长期记忆提取将在后续任务实现。
+提供数据库路径解析、短生命周期连接、版本化 Migration、Repository 数据访问层，
+以及后台回答 Job 的持久状态合同。
 """
 
 from src.storage.database import (
@@ -15,46 +15,84 @@ from src.storage.migrations import (
     get_user_version,
     migrate_database,
 )
+from src.storage.schemas import (
+    GenerationJob,
+    GenerationJobPayload,
+    GenerationJobStatus,
+)
+from src.storage.attachments import (
+    AttachmentStoreError,
+    delete_conversation_attachments,
+    delete_saved_attachments,
+    resolve_attachment_path,
+    save_image_attachments,
+)
 from src.storage.repositories import (
     RepositoryError,
     StorageError,
+    claim_generation_job,
     clear_conversation_contents,
+    complete_generation_job,
     create_conversation,
+    create_generation_job,
     deactivate_memory,
     delete_conversation,
     delete_memory,
+    enqueue_generation_job,
+    fail_generation_job,
     finalize_conversation_turn,
+    finalize_generation_job,
+    get_active_generation_job,
     get_agent_runs,
     get_conversation,
     get_conversation_state,
+    get_generation_job,
     get_recent_messages,
     insert_agent_run,
     insert_message,
     insert_or_merge_memory,
     list_conversations,
+    list_generation_jobs,
     list_memories,
     list_messages,
+    list_pending_generation_jobs,
+    mark_running_interrupted,
     rename_conversation,
     reset_conversation_state,
+    retry_generation_job,
     upsert_conversation_state,
 )
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
+    "AttachmentStoreError",
+    "GenerationJob",
+    "GenerationJobPayload",
+    "GenerationJobStatus",
     "RepositoryError",
     "StorageError",
     "apply_migration",
+    "claim_generation_job",
     "clear_conversation_contents",
+    "complete_generation_job",
     "connect_database",
     "create_conversation",
+    "create_generation_job",
     "deactivate_memory",
     "delete_conversation",
+    "delete_conversation_attachments",
+    "delete_saved_attachments",
     "delete_memory",
+    "enqueue_generation_job",
+    "fail_generation_job",
     "finalize_conversation_turn",
+    "finalize_generation_job",
+    "get_active_generation_job",
     "get_agent_runs",
     "get_conversation",
     "get_conversation_state",
     "get_database_path",
+    "get_generation_job",
     "get_recent_messages",
     "get_user_version",
     "insert_agent_run",
@@ -62,10 +100,16 @@ __all__ = [
     "insert_or_merge_memory",
     "initialize_database",
     "list_conversations",
+    "list_generation_jobs",
     "list_memories",
     "list_messages",
+    "list_pending_generation_jobs",
+    "mark_running_interrupted",
     "migrate_database",
     "rename_conversation",
+    "resolve_attachment_path",
     "reset_conversation_state",
+    "retry_generation_job",
+    "save_image_attachments",
     "upsert_conversation_state",
 ]

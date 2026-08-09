@@ -38,6 +38,8 @@ def fallback_dump() -> dict:
         "student_work_provided": False,
         "short_reason": "问题分析失败，按普通完整解题处理。",
         "calculation_required": False,
+        "context_relation": "uncertain",
+        "needs_previous_image_context": False,
     }
 
 

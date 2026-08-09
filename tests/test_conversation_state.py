@@ -15,6 +15,7 @@ from src.conversation import (
     requests_full_answer,
     resolve_conversation_state,
 )
+from src.conversation.state import build_analyzer_state_context
 
 
 def previous_state(**overrides: object) -> ConversationState:
@@ -75,6 +76,66 @@ class FollowUpDetectionTests(unittest.TestCase):
 
 
 class ResolveConversationStateTests(unittest.TestCase):
+    def test_semantic_follow_up_reuses_image_without_prefix_marker(self) -> None:
+        for text in ("铜片转到a时，求电流", "第三问怎么做", "a点时呢", "那②呢"):
+            with self.subTest(text=text):
+                resolved = resolve_conversation_state(
+                    text,
+                    previous_state=previous_state(),
+                    context_relation="follow_up",
+                    needs_previous_image_context=True,
+                )
+                self.assertTrue(resolved.is_follow_up)
+                self.assertEqual(
+                    resolved.active_problem_text,
+                    "电阻是 6Ω，电压 12V，求电流",
+                )
+                self.assertEqual(
+                    resolved.active_image_context,
+                    "这是一张串联电路图",
+                )
+
+    def test_semantic_new_problem_clears_old_image(self) -> None:
+        resolved = resolve_conversation_state(
+            "一辆小车 10 秒行驶 50 米，求平均速度",
+            previous_state=previous_state(),
+            context_relation="new_problem",
+            needs_previous_image_context=False,
+        )
+
+        self.assertFalse(resolved.is_follow_up)
+        self.assertIsNone(resolved.active_image_context)
+        self.assertEqual(
+            resolved.active_problem_text,
+            "一辆小车 10 秒行驶 50 米，求平均速度",
+        )
+
+    def test_uncertain_relation_conservatively_keeps_active_image(self) -> None:
+        resolved = resolve_conversation_state(
+            "a点时呢",
+            previous_state=previous_state(),
+            context_relation="uncertain",
+            needs_previous_image_context=False,
+        )
+
+        self.assertTrue(resolved.is_follow_up)
+        self.assertEqual(resolved.active_image_context, "这是一张串联电路图")
+
+    def test_follow_up_without_image_need_does_not_inject_old_image_state(self) -> None:
+        resolved = resolve_conversation_state(
+            "换一种文字方法解释",
+            previous_state=previous_state(),
+            context_relation="follow_up",
+            needs_previous_image_context=False,
+        )
+
+        self.assertTrue(resolved.is_follow_up)
+        self.assertEqual(
+            resolved.active_problem_text,
+            "电阻是 6Ω，电压 12V，求电流",
+        )
+        self.assertIsNone(resolved.active_image_context)
+
     def test_new_question_builds_fresh_state(self) -> None:
         resolved = resolve_conversation_state(
             "新的问题：凸透镜焦距 10cm",
@@ -248,6 +309,14 @@ class StateUpdateAfterTurnTests(unittest.TestCase):
 
 
 class TeachingStateContextTests(unittest.TestCase):
+    def test_analyzer_context_exposes_image_availability_not_full_text(self) -> None:
+        context = build_analyzer_state_context(previous_state())
+
+        self.assertIn("上一活动题目：电阻是 6Ω，电压 12V，求电流", context)
+        self.assertIn("上一题存在已确认图片上下文：是", context)
+        self.assertNotIn("这是一张串联电路图", context)
+        self.assertNotIn("data:image", context)
+
     def test_context_contains_safe_fields_only(self) -> None:
         resolved = resolve_conversation_state(
             "继续",

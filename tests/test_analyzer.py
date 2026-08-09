@@ -3,7 +3,7 @@ import unittest
 
 from src.analyzer import analyze_question
 from src.prompts import MODE_INSTRUCTIONS, QUESTION_ANALYZER_SYSTEM_PROMPT
-from src.schemas import TeachingMode
+from src.schemas import ContextRelation, TeachingMode
 
 
 def valid_payload(
@@ -20,6 +20,8 @@ def valid_payload(
         "student_work_provided": False,
         "short_reason": "这是一道条件完整的力学计算题。",
         "calculation_required": calculation_required,
+        "context_relation": "new_problem",
+        "needs_previous_image_context": False,
     }
 
 
@@ -62,6 +64,12 @@ class TestAnalyzeQuestion(unittest.TestCase):
             QUESTION_ANALYZER_SYSTEM_PROMPT,
         )
         self.assertIn("calculation_required=false", QUESTION_ANALYZER_SYSTEM_PROMPT)
+
+    def test_analyzer_prompt_defines_semantic_context_relation(self):
+        self.assertIn("context_relation", QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn("needs_previous_image_context", QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn("铜片转到 a 时", QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn("不要只看固定开头关键词", QUESTION_ANALYZER_SYSTEM_PROMPT)
 
     def test_valid_json_returns_question_analysis(self):
         analysis, fallback = analyze_question(
@@ -195,9 +203,25 @@ class TestAnalyzeQuestion(unittest.TestCase):
                 "student_work_provided": False,
                 "short_reason": "问题分析失败，按普通完整解题处理。",
                 "calculation_required": False,
+                "context_relation": "uncertain",
+                "needs_previous_image_context": False,
             },
         )
         self.assertTrue(fallback)
+
+    def test_context_relation_and_previous_image_need_are_parsed(self):
+        payload = valid_payload()
+        payload["context_relation"] = "follow_up"
+        payload["needs_previous_image_context"] = True
+
+        analysis, fallback = analyze_question(
+            "铜片转到 a 时，求电流。",
+            lambda question: json_result(payload),
+        )
+
+        self.assertIs(analysis.context_relation, ContextRelation.FOLLOW_UP)
+        self.assertTrue(analysis.needs_previous_image_context)
+        self.assertFalse(fallback)
 
     def test_empty_question_does_not_call_analyze_func(self):
         calls = []

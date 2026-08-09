@@ -10,10 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from src.storage import initialize_database, list_messages
+from src.storage import initialize_database, list_messages, resolve_attachment_path
 from src.vision.schemas import ImageQuestionExtraction
+from tests.app_task_manager import ImmediateGenerationTaskManager
 
 
 def png_bytes(color: str = "white") -> bytes:
@@ -85,6 +87,21 @@ def agent_result() -> dict[str, object]:
     }
 
 
+def independent_relation(*_args, **_kwargs):
+    return {
+        "relation": {
+            "relationship": "independent",
+            "image_roles": [
+                {"index": 1, "role": "other"},
+                {"index": 2, "role": "other"},
+            ],
+            "combined_context": "",
+            "short_reason": "两张图是独立题目。",
+        },
+        "model_requests": 1,
+    }
+
+
 def app_with_submission(text: str, pasted=None, attached=None) -> AppTest:
     app = AppTest.from_file("app.py")
     app.session_state["pending_chat_submission"] = {
@@ -101,14 +118,26 @@ def button(app: AppTest, label: str):
 
 class AppImageFlowTests(unittest.TestCase):
     def setUp(self) -> None:
+        st.cache_resource.clear()
+        self._manager_patch = patch(
+            "src.tasks.GenerationTaskManager",
+            ImmediateGenerationTaskManager,
+        )
+        self._manager_patch.start()
+        self.addCleanup(self._manager_patch.stop)
+        self.addCleanup(st.cache_resource.clear)
         self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self.db_path = str(Path(self._temp_dir.name) / "physics_teacher.db")
         os.environ["PHYSICS_AGENT_DB_PATH"] = self.db_path
+        os.environ["PHYSICS_AGENT_ATTACHMENT_ROOT"] = str(
+            Path(self._temp_dir.name) / "attachments"
+        )
         initialize_database(self.db_path)
 
     def tearDown(self) -> None:
         os.environ.pop("PHYSICS_AGENT_DB_PATH", None)
+        os.environ.pop("PHYSICS_AGENT_ATTACHMENT_ROOT", None)
 
     def agent_patch(self, side_effect=None, return_value=None):
         return patch(
@@ -165,6 +194,10 @@ class AppImageFlowTests(unittest.TestCase):
         )
         with (
             patch("src.vision.batch.analyze_uploaded_image", side_effect=fake_vision),
+            patch(
+                "src.vision.batch.analyze_batch_relation",
+                side_effect=independent_relation,
+            ),
             self.agent_patch(side_effect=fake_agent),
         ):
             app.run()
@@ -230,6 +263,37 @@ class AppImageFlowTests(unittest.TestCase):
             calls[0][0],
             "请分析并解答这些图片中的物理问题。",
         )
+        conversation_id = app.session_state["current_conversation_id"]
+        user_message = list_messages(conversation_id)[0]
+        self.assertEqual(user_message["display_content"], "")
+        rendered = "\n".join(str(item.value) for item in app.markdown)
+        self.assertNotIn("请分析并解答这些图片中的物理问题", rendered)
+
+    def test_original_attachment_is_persisted_and_history_reopens(self) -> None:
+        app = app_with_submission(
+            "",
+            attached=[image_item("original.png", png_bytes("green"))],
+        )
+        with (
+            patch(
+                "src.vision.batch.analyze_uploaded_image",
+                return_value=service_result(name="original"),
+            ),
+            self.agent_patch(return_value=agent_result()),
+        ):
+            app.run()
+        conversation_id = app.session_state["current_conversation_id"]
+        metadata = list_messages(conversation_id)[0]["image_metadata_json"]
+        self.assertEqual(len(metadata["attachments"]), 1)
+        stored_path = resolve_attachment_path(metadata["attachments"][0])
+        self.assertIsNotNone(stored_path)
+
+        reopened = AppTest.from_file("app.py")
+        reopened.session_state["current_conversation_id"] = conversation_id
+        reopened.run()
+        self.assertEqual(len(reopened.exception), 0)
+        button(reopened, "清空当前会话").click().run()
+        self.assertFalse(stored_path.exists())
 
     def test_more_than_three_images_stops_before_vision_and_agent(self) -> None:
         images = [
@@ -405,6 +469,23 @@ class AppImageFlowTests(unittest.TestCase):
         self.assertFalse(
             any("粘贴暂不可用" in str(item.value) for item in app.caption)
         )
+
+    def test_native_attachment_preview_grows_left_to_right(self) -> None:
+        source = Path("app.py").read_text(encoding="utf-8")
+        container_rule = source.split(
+            '[data-testid="stChatInput"] [data-testid="stFileChips"]',
+            1,
+        )[1].split("}", 1)[0]
+        file_rule = source.split(
+            '[data-testid="stChatInput"] [data-testid="stFileChips"] > div',
+            1,
+        )[1].split("}", 1)[0]
+
+        self.assertIn("flex-flow: row wrap", container_rule)
+        self.assertIn("justify-content: flex-start", container_rule)
+        self.assertIn("align-self: stretch", container_rule)
+        self.assertIn("direction: ltr", container_rule)
+        self.assertNotIn("margin-right: auto", file_rule)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ from src.conversation.state import (
 )
 from src.conversation.service import (
     ConversationServiceError,
+    enqueue_conversation_turn,
+    execute_generation_job,
     run_conversation_turn,
 )
 
@@ -33,6 +35,8 @@ __all__ = [
     "build_recent_history",
     "build_state_update_after_turn",
     "build_teaching_state_context",
+    "enqueue_conversation_turn",
+    "execute_generation_job",
     "is_follow_up_message",
     "requests_full_answer",
     "resolve_conversation_state",

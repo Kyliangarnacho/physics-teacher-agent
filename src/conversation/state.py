@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from src.conversation.schemas import ConversationState, validate_safe_text
+from src.schemas import ContextRelation
 
 
 _FOLLOW_UP_MARKERS = (
@@ -81,6 +82,8 @@ def resolve_conversation_state(
     previous_state: ConversationState | dict | None = None,
     current_image_context: str | None = None,
     mode_override: str = "auto",
+    context_relation: ContextRelation | str | None = None,
+    needs_previous_image_context: bool | None = None,
 ) -> ResolvedConversationState:
     """根据当前问题与旧状态解析新一轮会话状态。
 
@@ -99,8 +102,27 @@ def resolve_conversation_state(
 
     previous = _as_conversation_state(previous_state)
     image_context = validate_safe_text(current_image_context, "current_image_context")
+    if needs_previous_image_context is not None and not isinstance(
+        needs_previous_image_context,
+        bool,
+    ):
+        raise ValueError("needs_previous_image_context 必须是布尔值。")
 
-    follow_up = is_follow_up_message(question)
+    relation = (
+        ContextRelation(context_relation)
+        if context_relation is not None
+        else None
+    )
+    if relation is ContextRelation.FOLLOW_UP:
+        follow_up = previous is not None
+    elif relation is ContextRelation.NEW_PROBLEM:
+        follow_up = False
+    elif relation is ContextRelation.UNCERTAIN:
+        # 语义仍不确定时保守保留同一活动题，避免短小小问误清旧图。
+        follow_up = previous is not None
+    else:
+        # 兼容旧调用方：关键词只是无结构化 Analyzer 结果时的低成本提示。
+        follow_up = is_follow_up_message(question)
     exits_hint = requests_full_answer(question)
 
     if follow_up and previous is not None:
@@ -111,7 +133,13 @@ def resolve_conversation_state(
     if image_context is not None:
         active_image_context = image_context
     elif follow_up and previous is not None:
-        active_image_context = previous.active_image_context
+        if (
+            relation is ContextRelation.FOLLOW_UP
+            and needs_previous_image_context is False
+        ):
+            active_image_context = None
+        else:
+            active_image_context = previous.active_image_context
     else:
         active_image_context = None
 
@@ -135,6 +163,28 @@ def resolve_conversation_state(
         exits_hint=exits_hint,
         conversation_id=previous.conversation_id if previous is not None else None,
     )
+
+
+def build_analyzer_state_context(
+    previous_state: ConversationState | dict | None,
+) -> str | None:
+    """构建供 Analyzer 判断上下文关系的最小安全状态。
+
+    只提供上一活动题目、是否存在已确认图片文字上下文、教学模式和提示步数；
+    不提供图片文字全文、原图、Base64、Trace 或模型内部内容。
+    """
+    previous = _as_conversation_state(previous_state)
+    if previous is None or not previous.active_problem_text:
+        return None
+    lines = [f"上一活动题目：{previous.active_problem_text}"]
+    lines.append(
+        "上一题存在已确认图片上下文："
+        + ("是" if previous.active_image_context else "否")
+    )
+    if previous.teaching_mode:
+        lines.append(f"上一轮教学模式：{previous.teaching_mode}")
+    lines.append(f"已完成提示步数：{previous.hint_step}")
+    return "\n".join(lines)
 
 
 def build_teaching_state_context(

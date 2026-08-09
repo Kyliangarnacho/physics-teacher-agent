@@ -145,6 +145,7 @@ def extract_memory_candidates(
     explicit_user_feedback: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
     model_func: Callable[[list[dict[str, str]]], str] | None = None,
+    raise_on_model_error: bool = False,
 ) -> list[MemoryCandidate]:
     """从一轮对话提取最多 3 条长期记忆候选；不写数据库。
 
@@ -181,6 +182,8 @@ def extract_memory_candidates(
                 explicit_user_feedback,
                 conversation_history,
             )
-    except Exception:
+    except Exception as exc:
+        if raise_on_model_error:
+            raise RuntimeError("记忆提取模型调用失败。") from exc
         return []
     return _parse_candidates(raw)

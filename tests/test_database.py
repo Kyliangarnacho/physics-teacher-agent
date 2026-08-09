@@ -27,6 +27,7 @@ EXPECTED_TABLES = {
     "agent_runs",
     "conversation_states",
     "learning_memories",
+    "generation_jobs",
 }
 
 # PRAGMA table_info 每列返回 (type, notnull, dflt_value, pk) 的精确数据合同。
@@ -92,6 +93,20 @@ EXPECTED_COLUMNS = {
         "created_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
         "updated_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
     },
+    "generation_jobs": {
+        "id": {"type": "TEXT", "notnull": 0, "default": None, "pk": 1},
+        "conversation_id": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "user_message_id": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "status": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "payload_json": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "attempts": {"type": "INTEGER", "notnull": 1, "default": "0", "pk": 0},
+        "error_type": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
+        "error_message": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
+        "created_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "updated_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "started_at": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
+        "finished_at": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
+    },
 }
 
 # PRAGMA foreign_key_list 每行返回 (from, table, to, on_delete) 的精确数据合同。
@@ -101,6 +116,10 @@ EXPECTED_FOREIGN_KEYS = {
     "agent_runs": {("conversation_id", "conversations", "id", "CASCADE")},
     "conversation_states": {("conversation_id", "conversations", "id", "CASCADE")},
     "learning_memories": set(),
+    "generation_jobs": {
+        ("conversation_id", "conversations", "id", "CASCADE"),
+        ("user_message_id", "messages", "id", "CASCADE"),
+    },
 }
 
 API_CONFIG_KEYS = (
@@ -169,6 +188,7 @@ def index_specs(conn: sqlite3.Connection, table: str) -> dict[str, dict[str, obj
         specs[name] = {
             "unique": bool(row["unique"]),
             "origin": row["origin"],
+            "partial": bool(row["partial"]),
             "columns": [
                 item["name"]
                 for item in conn.execute(f"PRAGMA index_info({name})").fetchall()
@@ -270,14 +290,14 @@ class DatabaseMigrationTests(unittest.TestCase):
         returned_path = initialize_database(self.db_path)
 
         self.assertEqual(returned_path, self.db_path)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 2)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 3)
         conn = connect_database(self.db_path)
         try:
-            self.assertEqual(migrations.get_user_version(conn), 2)
+            self.assertEqual(migrations.get_user_version(conn), 3)
         finally:
             conn.close()
 
-    def test_initialization_creates_five_tables(self) -> None:
+    def test_initialization_creates_six_tables(self) -> None:
         initialize_database(self.db_path)
 
         conn = connect_database(self.db_path)
@@ -502,6 +522,72 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "idx_learning_memories_source_conversation_id",
                 index_specs(conn, "learning_memories"),
             )
+            job_indexes = index_specs(conn, "generation_jobs")
+            self.assertIn("idx_generation_jobs_conversation_id", job_indexes)
+            self.assertIn("idx_generation_jobs_status_created_at", job_indexes)
+            self.assertIn("uq_generation_jobs_active_conversation", job_indexes)
+            self.assertTrue(
+                job_indexes["uq_generation_jobs_active_conversation"]["unique"]
+            )
+            self.assertTrue(
+                job_indexes["uq_generation_jobs_active_conversation"]["partial"]
+            )
+            self.assertEqual(
+                job_indexes["uq_generation_jobs_active_conversation"]["columns"],
+                ["conversation_id"],
+            )
+        finally:
+            conn.close()
+
+    def test_v1_existing_data_survives_v2_and_v3_upgrade(self) -> None:
+        conn = connect_database(self.db_path)
+        try:
+            migrations.apply_migration(conn, 1, migrations._SCHEMA_MIGRATIONS[1])
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("conv-old", "升级前会话", ISO_TIME, ISO_TIME),
+            )
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, "
+                "display_content, model_content, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("msg-old", "conv-old", "user", "旧题目", "旧题目", ISO_TIME),
+            )
+            conn.commit()
+
+            self.assertEqual(migrations.migrate_database(conn), 3)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT title FROM conversations WHERE id = 'conv-old'"
+                ).fetchone()[0],
+                "升级前会话",
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT model_content FROM messages WHERE id = 'msg-old'"
+                ).fetchone()[0],
+                "旧题目",
+            )
+        finally:
+            conn.close()
+
+    def test_failed_v3_migration_rolls_back_table_and_indexes(self) -> None:
+        conn = connect_database(self.db_path)
+        try:
+            migrations.apply_migration(conn, 1, migrations._SCHEMA_MIGRATIONS[1])
+            migrations.apply_migration(conn, 2, migrations._SCHEMA_MIGRATIONS[2])
+            with self.assertRaises(sqlite3.OperationalError):
+                migrations.apply_migration(
+                    conn,
+                    3,
+                    (*migrations._SCHEMA_MIGRATIONS[3], "THIS IS NOT VALID SQL"),
+                )
+
+            self.assertEqual(migrations.get_user_version(conn), 2)
+            self.assertNotIn("generation_jobs", table_names(conn))
+            self.assertEqual(migrations.migrate_database(conn), 3)
+            self.assertIn("generation_jobs", table_names(conn))
         finally:
             conn.close()
 
@@ -511,7 +597,7 @@ class DatabaseMigrationTests(unittest.TestCase):
 
         conn = connect_database(self.db_path)
         try:
-            self.assertEqual(migrations.get_user_version(conn), 2)
+            self.assertEqual(migrations.get_user_version(conn), 3)
             self.assertEqual(table_names(conn), EXPECTED_TABLES)
         finally:
             conn.close()
@@ -532,19 +618,20 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(migrations.get_user_version(conn), 0)
             self.assertNotIn("partial_table", table_names(conn))
 
-            self.assertEqual(migrations.migrate_database(conn), 2)
+            self.assertEqual(migrations.migrate_database(conn), 3)
             self.assertEqual(table_names(conn), EXPECTED_TABLES)
         finally:
             conn.close()
 
-    def test_version_1_database_migrates_to_analysis_summary_column(self) -> None:
+    def test_version_1_database_migrates_through_v2_to_v3(self) -> None:
         conn = connect_database(self.db_path)
         try:
             migrations.apply_migration(conn, 1, migrations._SCHEMA_MIGRATIONS[1])
             self.assertEqual(migrations.get_user_version(conn), 1)
 
-            self.assertEqual(migrations.migrate_database(conn), 2)
+            self.assertEqual(migrations.migrate_database(conn), 3)
             self.assertIn("analysis_json", table_info(conn, "agent_runs"))
+            self.assertIn("generation_jobs", table_names(conn))
         finally:
             conn.close()
 

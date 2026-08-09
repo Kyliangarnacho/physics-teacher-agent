@@ -1,9 +1,4 @@
-"""Stage 10 Conversation Service：单轮对话的编排、持久化与状态推进。
-
-一轮流程：校验 → 读取最近历史与旧状态 → 解析状态与上下文 → 短事务保存
-user 消息 → 事务外调用 Agent → 短事务原子保存 assistant、agent_run 与状态。
-本模块不直接写 SQL，所有持久化都经由 Repository。
-"""
+"""Conversation Service：回答任务入队、执行与同步兼容入口。"""
 
 from __future__ import annotations
 
@@ -14,6 +9,7 @@ from src.conversation.history import build_recent_history
 from src.conversation.schemas import StoredMessage
 from src.conversation.state import (
     ResolvedConversationState,
+    build_analyzer_state_context,
     build_state_update_after_turn,
     build_teaching_state_context,
     resolve_conversation_state,
@@ -24,12 +20,14 @@ from src.memory.retrieval import (
 )
 from src.storage import (
     RepositoryError,
-    finalize_conversation_turn,
+    claim_generation_job,
+    enqueue_generation_job,
+    fail_generation_job,
+    finalize_generation_job,
     get_conversation,
     get_conversation_state,
+    get_generation_job,
     get_recent_messages,
-    insert_agent_run,
-    insert_message,
 )
 
 
@@ -86,30 +84,20 @@ def _build_agent_run(
     }
 
 
-def _write_failed_agent_run(
-    conversation_id: str,
-    user_message_id: str,
-    db_path,
-) -> None:
-    """尽力写入 failed agent_run；失败不影响原始异常。"""
+def _mark_job_failed(job_id: str, error_type: str, db_path) -> None:
+    """尽力把 running Job 标记失败；失败不遮蔽原始异常。"""
     try:
-        insert_agent_run(
-            {
-                "conversation_id": conversation_id,
-                "user_message_id": user_message_id,
-                "status": "failed",
-                "use_rag": False,
-                "use_tools": False,
-                "total_model_requests": 0,
-                "total_duration_ms": 0.0,
-            },
+        fail_generation_job(
+            job_id,
+            error_type,
+            "本轮回答生成失败，请稍后重试。",
             path=db_path,
         )
     except RepositoryError:
         pass
 
 
-def run_conversation_turn(
+def enqueue_conversation_turn(
     conversation_id: str,
     display_question: str,
     model_question: str,
@@ -118,30 +106,106 @@ def run_conversation_turn(
     mode_override: str = "auto",
     rag_policy: str = "auto",
     db_path=None,
-    agent_func=None,
     max_history_turns: int = 3,
     max_history_chars: int = 6000,
 ) -> dict[str, Any]:
-    """执行一轮对话并返回原 Agent 结果与持久化标识。
-
-    display_question 用于页面展示，model_question 用于发送给模型与后续历史；
-    Agent 异常时保留已保存的 user 消息并记录 failed run，然后抛
-    ConversationServiceError；blocked 返回时不推进状态。
-    """
+    """原子保存 user 消息和 pending Job；不读取上下文、不调用 Agent。"""
     if not isinstance(conversation_id, str) or not conversation_id.strip():
         raise ConversationServiceError("会话 ID 不能为空。")
-    display_question = _require_non_empty_text(display_question, "display_question")
+    if not isinstance(display_question, str):
+        raise ConversationServiceError("display_question 必须是字符串。")
+    display_question = display_question.strip()
+    if not display_question and not image_metadata:
+        raise ConversationServiceError("无图片时 display_question 不能为空。")
     model_question = _require_non_empty_text(model_question, "model_question")
 
     conversation = get_conversation(conversation_id, path=db_path)
     if conversation is None:
         raise ConversationServiceError("会话不存在，无法继续对话。")
 
+    try:
+        enqueued = enqueue_generation_job(
+            {
+                "conversation_id": conversation_id,
+                "role": "user",
+                "display_content": display_question,
+                "model_content": model_question,
+                "image_metadata_json": image_metadata,
+            },
+            {
+                "question": model_question,
+                "mode_override": mode_override,
+                "rag_policy": rag_policy,
+                "image_context": confirmed_image_context,
+                "image_context_available": bool(confirmed_image_context),
+                "max_history_turns": max_history_turns,
+                "max_history_chars": max_history_chars,
+            },
+            path=db_path,
+        )
+    except RepositoryError as exc:
+        raise ConversationServiceError("本轮问题入队失败，请稍后重试。") from exc
+
+    job = enqueued["generation_job"]
+    user_message = enqueued["user_message"]
+    return {
+        "conversation_id": conversation_id,
+        "user_message_id": user_message["id"],
+        "generation_job_id": job["id"],
+        "generation_job": job,
+    }
+
+
+def execute_generation_job(
+    job_id: str,
+    *,
+    db_path=None,
+    agent_func=None,
+) -> dict[str, Any]:
+    """领取 Job，从数据库恢复上下文，调用 Agent 并原子保存成功结果。"""
+    job_id = _require_non_empty_text(job_id, "job_id")
+    try:
+        job = claim_generation_job(job_id, path=db_path)
+    except RepositoryError as exc:
+        raise ConversationServiceError("回答任务领取失败，请稍后重试。") from exc
+    if job is None:
+        try:
+            existing = get_generation_job(job_id, path=db_path)
+        except RepositoryError as exc:
+            raise ConversationServiceError("回答任务状态读取失败，请稍后重试。") from exc
+        if existing is None:
+            raise ConversationServiceError("回答任务不存在。")
+        return {
+            "conversation_id": existing["conversation_id"],
+            "user_message_id": existing["user_message_id"],
+            "generation_job_id": job_id,
+            "generation_job": existing,
+            "skipped": True,
+        }
+
+    conversation_id = job["conversation_id"]
+    user_message_id = job["user_message_id"]
+    payload = job["payload"]
+    model_question = payload["question"]
+    mode_override = payload["mode_override"]
+    rag_policy = payload["rag_policy"]
+    confirmed_image_context = payload.get("image_context")
+    max_history_turns = payload["max_history_turns"]
+    max_history_chars = payload["max_history_chars"]
+
+    conversation = get_conversation(conversation_id, path=db_path)
+    if conversation is None:
+        _mark_job_failed(job_id, "conversation_missing", db_path)
+        raise ConversationServiceError("会话不存在，无法执行回答任务。")
+
     recent_messages = get_recent_messages(
         conversation_id,
-        limit=max_history_turns * 2 + 1,
+        limit=max(1, max_history_turns * 2 + 1),
         path=db_path,
     )
+    recent_messages = [
+        item for item in recent_messages if item["id"] != user_message_id
+    ]
     stored_messages = [
         StoredMessage.model_validate(item) for item in recent_messages
     ]
@@ -152,17 +216,17 @@ def run_conversation_turn(
     )
     old_state = get_conversation_state(conversation_id, path=db_path)
 
-    resolved = resolve_conversation_state(
+    preliminary_resolved = resolve_conversation_state(
         model_question,
         previous_state=old_state,
         current_image_context=confirmed_image_context,
         mode_override=mode_override,
     )
-    teaching_state_context = build_teaching_state_context(resolved)
+    teaching_state_context = build_analyzer_state_context(old_state)
     try:
         memories = retrieve_relevant_memories(
             model_question,
-            active_problem_text=resolved.active_problem_text,
+            active_problem_text=preliminary_resolved.active_problem_text,
             db_path=db_path,
         )
         memory_context = build_learning_memory_context(memories)
@@ -170,26 +234,14 @@ def run_conversation_turn(
         memories = []
         memory_context = None
     effective_model_question = _build_effective_model_question(
-        resolved,
+        preliminary_resolved,
         model_question,
     )
 
-    user_message = insert_message(
-        {
-            "conversation_id": conversation_id,
-            "role": "user",
-            "display_content": display_question,
-            "model_content": model_question,
-            "image_metadata_json": image_metadata,
-        },
-        path=db_path,
-    )
-    user_message_id = user_message["id"]
-
     agent = agent_func if agent_func is not None else _default_run_agent
     agent_mode_override = (
-        resolved.teaching_mode
-        if resolved.teaching_mode is not None
+        preliminary_resolved.teaching_mode
+        if preliminary_resolved.teaching_mode is not None
         else mode_override
     )
     try:
@@ -197,15 +249,37 @@ def run_conversation_turn(
             effective_model_question,
             mode_override=agent_mode_override,
             rag_policy=rag_policy,
-            image_context=resolved.active_image_context,
-            image_context_available=bool(resolved.active_image_context),
+            image_context=confirmed_image_context,
+            image_context_available=bool(confirmed_image_context),
             conversation_history=history,
             teaching_state_context=teaching_state_context,
             learning_memory_context=memory_context,
+            previous_problem_text=(
+                old_state.get("active_problem_text")
+                if old_state and not preliminary_resolved.is_follow_up
+                else None
+            ),
+            previous_image_context=(
+                old_state.get("active_image_context") if old_state else None
+            ),
         )
     except Exception as exc:
-        _write_failed_agent_run(conversation_id, user_message_id, db_path)
+        _mark_job_failed(job_id, "agent_error", db_path)
         raise ConversationServiceError("本轮回答生成失败，请稍后重试。") from exc
+
+    analysis_data = agent_result.get("analysis") or {}
+    context_relation = analysis_data.get("context_relation")
+    needs_previous_image_context = analysis_data.get(
+        "needs_previous_image_context"
+    )
+    resolved = resolve_conversation_state(
+        model_question,
+        previous_state=old_state,
+        current_image_context=confirmed_image_context,
+        mode_override=mode_override,
+        context_relation=context_relation,
+        needs_previous_image_context=needs_previous_image_context,
+    )
 
     trace_status = _trace_status(agent_result)
     succeeded = trace_status not in ("blocked", "failed")
@@ -222,7 +296,8 @@ def run_conversation_turn(
         state_update["conversation_id"] = conversation_id
 
     try:
-        finalized = finalize_conversation_turn(
+        finalized = finalize_generation_job(
+            job_id,
             conversation_id,
             assistant_message={
                 "conversation_id": conversation_id,
@@ -239,6 +314,7 @@ def run_conversation_turn(
             path=db_path,
         )
     except RepositoryError as exc:
+        _mark_job_failed(job_id, "persistence_error", db_path)
         raise ConversationServiceError("本轮结果保存失败，请稍后重试。") from exc
 
     return {
@@ -246,9 +322,44 @@ def run_conversation_turn(
         "conversation_id": conversation_id,
         "user_message_id": user_message_id,
         "assistant_message_id": finalized["assistant_message_id"],
+        "generation_job_id": job_id,
+        "generation_job": finalized["generation_job"],
         "resolved_state": resolved,
         "history_turn_count": len(history) // 2,
         "state_context_used": bool(teaching_state_context),
         "memory_count": len(memories),
         "memory_context_used": bool(memory_context),
     }
+
+
+def run_conversation_turn(
+    conversation_id: str,
+    display_question: str,
+    model_question: str,
+    image_metadata: dict[str, Any] | list[dict[str, Any]] | None = None,
+    confirmed_image_context: str | None = None,
+    mode_override: str = "auto",
+    rag_policy: str = "auto",
+    db_path=None,
+    agent_func=None,
+    max_history_turns: int = 3,
+    max_history_chars: int = 6000,
+) -> dict[str, Any]:
+    """同步兼容入口：先入队，再立即执行同一个 Generation Job。"""
+    enqueued = enqueue_conversation_turn(
+        conversation_id,
+        display_question,
+        model_question,
+        image_metadata=image_metadata,
+        confirmed_image_context=confirmed_image_context,
+        mode_override=mode_override,
+        rag_policy=rag_policy,
+        db_path=db_path,
+        max_history_turns=max_history_turns,
+        max_history_chars=max_history_chars,
+    )
+    return execute_generation_job(
+        enqueued["generation_job_id"],
+        db_path=db_path,
+        agent_func=agent_func,
+    )

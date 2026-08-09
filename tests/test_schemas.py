@@ -6,7 +6,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from src.schemas import QuestionAnalysis, RouteDecision, TeachingMode
+from src.schemas import ContextRelation, QuestionAnalysis, RouteDecision, TeachingMode
 
 
 def valid_analysis_data() -> dict[str, object]:
@@ -70,6 +70,22 @@ class QuestionAnalysisTests(unittest.TestCase):
         analysis = QuestionAnalysis(**valid_analysis_data())
 
         self.assertFalse(analysis.calculation_required)
+
+    def test_context_relation_defaults_preserve_old_payloads(self) -> None:
+        analysis = QuestionAnalysis(**valid_analysis_data())
+
+        self.assertIs(analysis.context_relation, ContextRelation.UNCERTAIN)
+        self.assertFalse(analysis.needs_previous_image_context)
+
+    def test_context_relation_accepts_all_values(self) -> None:
+        for relation in ContextRelation:
+            with self.subTest(relation=relation.value):
+                data = valid_analysis_data()
+                data["context_relation"] = relation.value
+                data["needs_previous_image_context"] = True
+                analysis = QuestionAnalysis(**data)
+                self.assertIs(analysis.context_relation, relation)
+                self.assertTrue(analysis.needs_previous_image_context)
 
     def test_rejects_invalid_teaching_mode(self) -> None:
         data = valid_analysis_data()

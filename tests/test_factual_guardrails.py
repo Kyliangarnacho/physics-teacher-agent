@@ -6,7 +6,10 @@ import json
 import unittest
 from pathlib import Path
 
-from src.prompts import JUNIOR_PHYSICS_SYSTEM_PROMPT
+from src.prompts import (
+    JUNIOR_PHYSICS_SYSTEM_PROMPT,
+    QUESTION_ANALYZER_SYSTEM_PROMPT,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +45,16 @@ class FactualGuardrailTests(unittest.TestCase):
         self.assertIn("其他工作条件下实际功率可能不同", content)
         self.assertIn("白炽灯丝电阻会随温度变化", content)
         self.assertIn("不能简单视为始终不变", content)
+
+    def test_teacher_no_longer_rejects_only_because_domain_is_broader(self) -> None:
+        self.assertIn("这属于高中内容", JUNIOR_PHYSICS_SYSTEM_PROMPT)
+        self.assertIn("轻量闲聊", JUNIOR_PHYSICS_SYSTEM_PROMPT)
+        self.assertIn("不得把它作为拒答理由", JUNIOR_PHYSICS_SYSTEM_PROMPT)
+
+    def test_non_physics_analysis_disables_physics_rag_and_tools(self) -> None:
+        self.assertIn('physics_topic 可写“非物理”', QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn("needs_rag=false", QUESTION_ANALYZER_SYSTEM_PROMPT)
+        self.assertIn("calculation_required=false", QUESTION_ANALYZER_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

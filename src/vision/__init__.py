@@ -3,11 +3,19 @@
 from src.vision.client import VisionClientError, extract_image_question
 from src.vision.batch import (
     MAX_BATCH_IMAGES,
+    batch_needs_confirmation,
     build_batch_image_context,
     image_is_unreadable,
     image_needs_confirmation,
     merge_image_inputs,
     process_image_batch,
+)
+from src.vision.batch_relation import (
+    BatchImageRole,
+    BatchRelation,
+    BatchRelationAnalysis,
+    BatchRelationError,
+    analyze_batch_relation,
 )
 from src.vision.context import build_image_context_draft
 from src.vision.image_utils import prepare_image
@@ -23,6 +31,10 @@ from src.vision.schemas import (
 
 __all__ = [
     "ExtractionStatus",
+    "BatchImageRole",
+    "BatchRelation",
+    "BatchRelationAnalysis",
+    "BatchRelationError",
     "ImageQuestionExtraction",
     "OCRClientError",
     "OCRResult",
@@ -31,6 +43,8 @@ __all__ = [
     "VisionClientError",
     "MAX_BATCH_IMAGES",
     "analyze_uploaded_image",
+    "analyze_batch_relation",
+    "batch_needs_confirmation",
     "build_batch_image_context",
     "build_image_context_draft",
     "extract_image_question",

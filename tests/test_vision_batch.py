@@ -6,12 +6,14 @@ import json
 import unittest
 
 from src.vision.batch import (
+    batch_needs_confirmation,
     build_batch_image_context,
     image_is_unreadable,
     image_needs_confirmation,
     merge_image_inputs,
     process_image_batch,
 )
+from src.vision.batch_relation import BatchRelationAnalysis
 from src.vision.schemas import ImageQuestionExtraction
 
 
@@ -63,6 +65,21 @@ def image(name: str, content: bytes) -> dict:
 
 
 class VisionBatchTests(unittest.TestCase):
+    @staticmethod
+    def same_problem_relation(_summaries, **_kwargs):
+        return {
+            "relation": BatchRelationAnalysis(
+                relationship="same_problem",
+                image_roles=[
+                    {"index": 1, "role": "stem"},
+                    {"index": 2, "role": "options"},
+                ],
+                combined_context="题干要求选出正确选项，选项为 A、B、C、D。",
+                short_reason="第二张承接第一张的选项。",
+            ),
+            "model_requests": 1,
+        }
+
     def test_pasted_then_attached_order_is_stable(self) -> None:
         merged = merge_image_inputs(
             [image("paste.png", b"paste")],
@@ -203,6 +220,64 @@ class VisionBatchTests(unittest.TestCase):
         self.assertTrue(image_needs_confirmation(uncertain))
         self.assertTrue(image_needs_confirmation(confirmation))
         self.assertTrue(image_is_unreadable(unreadable))
+
+    def test_stem_and_options_merge_as_same_problem(self) -> None:
+        batch = process_image_batch(
+            [image("stem.png", b"stem"), image("options.png", b"options")],
+            analyze_func=lambda _b, filename, **_k: service_result(text=filename),
+            relation_func=self.same_problem_relation,
+        )
+        context = build_batch_image_context(
+            batch["images"],
+            relation=batch["relation"],
+        )
+        self.assertIn("多图关系：同一道题", context)
+        self.assertIn("图片1=stem", context)
+        self.assertIn("图片2=options", context)
+        self.assertIn("选项为 A、B、C、D", context)
+        self.assertFalse(batch_needs_confirmation(batch))
+
+    def test_independent_relation_keeps_numbered_answers(self) -> None:
+        def independent(_summaries, **_kwargs):
+            return {
+                "relation": {
+                    "relationship": "independent",
+                    "image_roles": [
+                        {"index": 1, "role": "other"},
+                        {"index": 2, "role": "other"},
+                    ],
+                    "combined_context": "",
+                    "short_reason": "两张图的题干和已知量互不相关。",
+                },
+                "model_requests": 1,
+            }
+
+        batch = process_image_batch(
+            [image("one.png", b"one"), image("two.png", b"two")],
+            analyze_func=lambda _b, filename, **_k: service_result(text=filename),
+            relation_func=independent,
+        )
+        context = build_batch_image_context(
+            batch["images"],
+            relation=batch["relation"],
+        )
+        self.assertIn("独立题目，请按图片编号分别回答", context)
+
+    def test_uncertain_relation_requires_confirmation(self) -> None:
+        batch = process_image_batch(
+            [image("one.png", b"one"), image("two.png", b"two")],
+            analyze_func=lambda _b, filename, **_k: service_result(text=filename),
+            relation_func=lambda *_a, **_k: {
+                "relation": {
+                    "relationship": "uncertain",
+                    "image_roles": [],
+                    "combined_context": "",
+                    "short_reason": "图片之间缺少明确承接标记。",
+                },
+                "model_requests": 1,
+            },
+        )
+        self.assertTrue(batch_needs_confirmation(batch))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,11 @@ from typing import Any
 from uuid import uuid4
 
 from src.vision.context import build_image_context_draft
+from src.vision.batch_relation import (
+    BatchRelation,
+    BatchRelationAnalysis,
+    analyze_batch_relation,
+)
 from src.vision.schemas import ExtractionStatus, ImageQuestionExtraction
 from src.vision.service import analyze_uploaded_image
 
@@ -115,6 +120,7 @@ def process_image_batch(
     user_instruction: str = "",
     cache: MutableMapping[str, dict[str, Any]] | None = None,
     analyze_func: Callable[..., dict[str, Any]] | None = None,
+    relation_func: Callable[..., dict[str, Any]] | None = None,
     progress_func: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Analyze up to three unique images and return only safe results."""
@@ -164,10 +170,66 @@ def process_image_batch(
             }
         )
 
+    relation: BatchRelationAnalysis | None = None
+    relation_model_requests = 0
+    if len(records) > 1:
+        relation_key = "batch-relation:" + _cache_key(
+            ":".join(item["raw_hash"] for item in unique_images),
+            mode,
+            user_instruction,
+        )
+        cached_relation = cache_store.get(relation_key)
+        if cached_relation is None:
+            summaries = [
+                {
+                    "index": record["index"],
+                    "filename": record["filename"],
+                    "extracted_context": build_image_context_draft(
+                        record["extraction"]
+                    ),
+                }
+                for record in records
+            ]
+            if analyze_func is not None and relation_func is None:
+                relation = BatchRelationAnalysis(
+                    relationship=BatchRelation.INDEPENDENT,
+                    image_roles=[
+                        {"index": record["index"], "role": "other"}
+                        for record in records
+                    ],
+                    combined_context="",
+                    short_reason="测试注入未提供多图关系分析。",
+                )
+            else:
+                relation_call = relation_func or analyze_batch_relation
+                relation_result = relation_call(
+                    summaries,
+                    user_instruction=user_instruction,
+                )
+                relation_value = relation_result.get("relation")
+                relation = (
+                    relation_value
+                    if isinstance(relation_value, BatchRelationAnalysis)
+                    else BatchRelationAnalysis.model_validate(relation_value)
+                )
+                relation_model_requests = int(
+                    relation_result.get("model_requests", 0)
+                )
+            cached_relation = {
+                "relation": relation.model_dump(mode="json"),
+                "model_requests": relation_model_requests,
+            }
+            cache_store[relation_key] = cached_relation
+        else:
+            relation = BatchRelationAnalysis.model_validate(
+                cached_relation["relation"]
+            )
+
     return {
         "batch_id": uuid4().hex,
         "images": records,
-        "model_requests": actual_model_requests,
+        "relation": relation,
+        "model_requests": actual_model_requests + relation_model_requests,
     }
 
 
@@ -188,10 +250,23 @@ def image_is_unreadable(record: dict[str, Any]) -> bool:
     return extraction.status is ExtractionStatus.UNREADABLE
 
 
+def batch_needs_confirmation(batch: dict[str, Any]) -> bool:
+    """Require confirmation for ambiguous per-image or batch-level results."""
+    images = batch.get("images", [])
+    if any(image_needs_confirmation(record) for record in images):
+        return True
+    relation = batch.get("relation")
+    return bool(
+        isinstance(relation, BatchRelationAnalysis)
+        and relation.relationship is BatchRelation.UNCERTAIN
+    )
+
+
 def build_batch_image_context(
     records: Iterable[dict[str, Any]],
     *,
     context_overrides: dict[int, str] | None = None,
+    relation: BatchRelationAnalysis | None = None,
 ) -> str:
     """Combine per-image drafts in stable order without semantic guessing."""
     overrides = context_overrides or {}
@@ -213,7 +288,22 @@ def build_batch_image_context(
         if not context:
             raise ValueError(f"图片 {index} 的上下文不能为空。")
         sections.append(f"【图片 {index}：{filename}】\n{context}")
-    if len(sections) > 1:
+    if len(sections) > 1 and relation is not None:
+        if relation.relationship is BatchRelation.SAME_PROBLEM:
+            roles = "；".join(
+                f"图片{item.index}={item.role}" for item in relation.image_roles
+            )
+            sections.insert(
+                0,
+                "【多图关系：同一道题】\n"
+                f"各图作用：{roles}\n"
+                f"融合题意：{relation.combined_context.strip()}",
+            )
+        elif relation.relationship is BatchRelation.UNCERTAIN:
+            sections.insert(0, "【多图关系待确认】")
+    if len(sections) > 1 and (
+        relation is None or relation.relationship is BatchRelation.INDEPENDENT
+    ):
         answer_rule = (
             "【多图回答规则】\n"
             "多张图片若是独立题目，请按图片编号分别回答；"

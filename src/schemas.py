@@ -34,6 +34,14 @@ class TeachingMode(str, Enum):
     DIAGNOSE = "diagnose"
 
 
+class ContextRelation(str, Enum):
+    """当前问题与上一活动题目的语义关系。"""
+
+    FOLLOW_UP = "follow_up"
+    NEW_PROBLEM = "new_problem"
+    UNCERTAIN = "uncertain"
+
+
 class RunStatus(str, Enum):
     """一次 Agent 运行的最终状态。"""
 
@@ -66,6 +74,8 @@ class QuestionAnalysis(BaseModel):
     student_work_provided: bool
     short_reason: ShortReasonText
     calculation_required: StrictBool = False
+    context_relation: ContextRelation = ContextRelation.UNCERTAIN
+    needs_previous_image_context: StrictBool = False
 
 
 class RouteDecision(BaseModel):

@@ -1,18 +1,23 @@
 # 当前状态
 
-## Stage 11.1 状态
+## Stage 11.2 状态
 
 “初中物理教师 Agent + 阿里云百炼千问 API”当前使用 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。Stage 10 在 Stage 09 视觉/多图基础上加入 SQLite 持久会话、
 多会话管理、最近历史与教学状态，以及长期学习记忆的手动提取、确认和召回；Stage 11.1
-进一步加入有限多工具编排、参数 repair、Model-only fallback 和公开工具选择评测。
+进一步加入有限多工具编排、参数 repair、Model-only fallback 和公开工具选择评测。Stage 11.2
+现已加入 SQLite Generation Job、双 Worker 后台生成、启动恢复、人工 Retry 和 Streamlit
+局部状态轮询；页面提交问题后会立即持久化 user 消息，不再同步等待 Agent 完成。当前还支持
+受控本地图片附件持久化、同批多图关系融合、Analyzer 语义判断的跨轮图片上下文继承，以及
+独立单 Worker 的异步学习表现分析。
 
 当前个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心。幽默仅在语境自然匹配时
 偶尔出现，不要求每题都有。
 
 ## 当前结构
 
-- `app.py`：Streamlit 文本/多图片聊天入口，编排视觉识别、人工确认和统一 Agent
+- `app.py`：Streamlit 文本/多图片聊天入口；视觉识别与人工确认在页面线程完成，确认后的教师
+  回答进入后台 Generation Job
 - `main.py`：固定平均速度题的终端回归入口
 - `src/config.py`：使用 `python-dotenv` 加载并校验千问配置
 - `src/schemas.py`：定义教学模式、带计算需求的分析结果和带工具决策的路由结果
@@ -32,16 +37,19 @@
   重试且不会重复执行已成功的本地工具
 - `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并定义统一安全错误类别
 - `src/retry.py`：提供至多重试一次的通用有限 Retry
-- `src/vision/`：图片预处理、视觉/OCR Client、结果合并、安全上下文及多图 Batch
+- `src/vision/`：图片预处理、视觉/OCR Client、结果合并、安全上下文、多图 Batch 与关系融合
 - `src/ui/paste_images.py`：图片粘贴辅助和哈希去重；原生附件上传仍可独立使用
-- `src/storage/`：SQLite 连接、Migration V1（五张表）与 Repository 数据访问层
-- `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析与 Conversation Service
-- `src/memory/`：长期记忆候选提取、确认、检索与模型注入
+- `src/storage/`：SQLite 短连接、Migration V1～V3、Generation Job Schema 与 Repository 数据访问层
+- `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析，以及 enqueue/execute 分离的
+  Conversation Service；旧同步入口继续保留
+- `src/tasks/`：固定两个 Worker 的 GenerationTaskManager，及独立单 Worker 的学习表现分析任务管理器
+- `src/memory/`：长期记忆候选提取、确认、检索、模型注入与异步学习表现分析
 - `scripts/probe_stage09_vision.py`：视觉模型结构化提取能力的人工诊断探针
 - `scripts/probe_stage10_conversation_context.py` / `probe_stage10_conversation_service.py`：
   历史/状态注入与两轮会话的真实探针
 - `scripts/probe_stage10_memory_candidates.py` / `probe_stage10_memory_retrieval.py` /
   `probe_stage10_memory_page.py`：长期记忆候选、检索与页面交互的真实探针
+- `scripts/probe_stage11_2_background_jobs.py`：不调用 API 的双会话 Fake Slow 后台任务验收入口
 - `scripts/probe_stage07_function_calling.py`：底层 Function Calling 人工诊断探针
 - `scripts/probe_stage07_agent_e2e.py`：统一 Agent 真实端到端验收探针
 - `scripts/validate_knowledge_base.py`：校验知识库 JSONL、字段、类型和 ID 唯一性
@@ -70,14 +78,18 @@ API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 → 图片内存预处理与同批去重
 → 每张图片独立 Vision 提取
 → 按需执行可选 OCR 并合并
+→ 多图关系判断：同题融合或独立题分别保留
 → 清晰结果自动采用；不确定结果等待一次人工确认
 → 按图片顺序构造已确认上下文
-→ Analyzer → Router → 可选 RAG / Tool → 最终回答
+→ 原子保存 user 与 pending Generation Job
+→ 后台 Worker 恢复已确认上下文并执行 Analyzer → Router → 可选 RAG / Tool → 最终回答
 → 页面展示安全识别元数据、来源、工具记录和 Trace
 ```
 
-图片原始字节、Data URL、Base64 和完整确认上下文不会写入聊天历史或 Trace。上传新 Batch 或
-完成一次发送后，不会让上一批图片自动进入下一轮纯文字问题。
+原图以受控本地附件文件保存，SQLite 消息元数据仅保存附件 ID、相对路径、MIME、文件名和哈希；
+图片原始字节、Data URL、Base64 和完整确认上下文不会写入 Generation Job、聊天元数据或 Trace。
+上传新 Batch 或完成一次发送后，不会让上一批图片自动进入下一轮纯文字问题；但 Analyzer 判断为
+follow-up/uncertain 时，可安全继承上一题已确认的图片文本上下文。
 
 ## 运行命令
 
@@ -167,9 +179,21 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
 （6000 字符）与教学状态（含连续 hint）会注入 Analyzer、普通回答、RAG 和 Tool 链路；
 当前问题始终是最后一条 user 消息。
 
+后台回答状态为 `pending → running → completed/failed`；服务启动时遗留 `running` 会标记为
+`interrupted`，`pending` 会自动重新调度。`failed/interrupted` 只能人工 Retry，且复用原 Job 与
+原 user 消息。Streamlit 使用进程级缓存的 Task Manager 和只读 fragment Polling：仅当前会话
+存在活动 Job 时轮询，终态后停止并刷新消息。不同会话按 `conversation_id` 隔离，可由两个
+Worker 并发生成；活动会话可重命名，但不能删除或清空。
+
+Generation Job 只保存回答所需文本参数和已确认图片上下文。严格 Schema 拒绝 bytes、额外字段、
+未确认图片上下文、Data URL 与明显 Base64；原图、UploadedFile、Data URL 和 Base64 不进入 Job。
+Worker 不访问 `st.*` 或 `session_state`，每次 Repository 操作独立打开 SQLite 短连接；进程内
+`scheduled` 集合与数据库原子 claim 共同防止重复执行。
+
 ## 长期记忆流程
 
-- 成功回答下方可点击“分析本轮学习表现”手动提取候选（不自动提取）；
+- 成功回答下方可点击“分析本轮学习表现”手动提取候选（不自动提取）；提取在独立后台线程执行，
+  不占用 Generation Job 的两个 Worker，也不会阻塞继续提问或切换会话；
 - 候选暂存 `session_state`（按会话与消息隔离），确认保存后才写入 learning_memories；
 - 只有 `confirmed=1` 且 `active=1` 的记忆会被召回并注入相关题目；
 - “学习档案”展示已确认记忆，支持停用和删除；
@@ -193,7 +217,7 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
 - BM25 默认 `top_k=3`、`min_score_ratio=0.3`
 - 检索器固定查询能够命中对应电路、凸透镜和电热器卡片
 - context 注入、无来源回退、sources 顺序和精简字段均有 mock/fake 测试
-- 当前共有 608 项单元测试，全部通过
+- 当前共有 680 项单元测试，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，并真实验证电热器、凸透镜 RAG 问答
 - 加入相对分数过滤后再次验证电热器问题，网页来源只返回 `KB-POWER-001`
 - 页面与终端验证过程中没有出现应用 traceback
@@ -229,6 +253,8 @@ route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 
   Model-only fallback；已成功工具不会因 repair 或最终回答重试重复执行
 - 已建立 24 条公开工具适用性评测；正式 Tool Selection 规则复测为 precision 92.3%、
   recall 80.0%、no-tool 正确率 83.3%、多工具完整命中率 100%，保留 1 次误调用作为限制
+- Stage 11.2 Generation Job、Migration V3、enqueue/execute、双 Worker Task Manager、recover、
+  Retry、Streamlit 状态展示、局部 Polling、多会话隔离及活动会话保护均有 Fake/Mock 测试覆盖
 
 用户已手动验证：
 
@@ -258,5 +284,12 @@ Stage 08 的 8 道题是工程路径小样本，未对全部回答进行系统�
 长期记忆检索目前是关键词确定性近似。未确认候选只存在 `session_state`；暂无重新启用
 长期记忆的页面操作；V1 没有单独持久化 assistant 的 analysis 字段。
 图片理解仍可能受清晰度、手写内容和复杂图形影响；一次最多处理 3 张图片，OCR 只有在本地
-配置可用模型时才启用，不确定结果仍需人工确认。知识库仍只有 10 条卡片；尚未实现向量检索、
-MCP、微调或通用跨图片语义推理。
+配置可用模型时才启用，不确定结果仍需人工确认。当前仅支持同批图片的有限关系融合；知识库仍
+只有 10 条卡片；尚未实现向量检索、MCP、微调或通用视觉推理。
+
+后台任务仍是单进程 `ThreadPoolExecutor` 实现，最多两个 Worker，不是分布式队列；进程退出时
+遗留 running 会在下次启动变为 interrupted，需要人工 Retry。Vision/OCR 和人工确认仍在页面
+线程同步完成，Stage 11.2 只后台化确认后的教师回答生成。
+
+近期历史窗口仍固定为最多 3 个完整轮次、6000 字符；页面显示的完整历史不等于模型长期上下文，
+长期上下文管理留待后续阶段处理。

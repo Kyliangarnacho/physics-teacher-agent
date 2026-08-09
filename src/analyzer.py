@@ -12,7 +12,13 @@ from src.model_client import build_conversation_messages
 from src.observability import ErrorType, StepTimer
 from src.prompts import QUESTION_ANALYZER_SYSTEM_PROMPT
 from src.retry import run_with_one_retry
-from src.schemas import QuestionAnalysis, StepStatus, StepTrace, TeachingMode
+from src.schemas import (
+    ContextRelation,
+    QuestionAnalysis,
+    StepStatus,
+    StepTrace,
+    TeachingMode,
+)
 
 
 AnalyzeFunc = Callable[[str], str]
@@ -30,6 +36,8 @@ def _safe_default_analysis() -> QuestionAnalysis:
         student_work_provided=False,
         short_reason="问题分析失败，按普通完整解题处理。",
         calculation_required=False,
+        context_relation=ContextRelation.UNCERTAIN,
+        needs_previous_image_context=False,
     )
 
 

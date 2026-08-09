@@ -1,4 +1,4 @@
-"""Stage 10 Repository 数据访问层。
+"""SQLite Repository 数据访问层。
 
 约定：
 - SQL 只集中在本文件，业务文件不直接接触 SQLite；
@@ -19,6 +19,13 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
+from src.storage.schemas import (
+    GenerationJob,
+    GenerationJobPayload,
+    GenerationJobStatus,
+)
 from src.storage.database import DatabasePath, connect_database
 
 
@@ -78,6 +85,21 @@ _MEMORY_COLUMNS = (
     "created_at",
     "updated_at",
 )
+_GENERATION_JOB_COLUMNS = (
+    "id",
+    "conversation_id",
+    "user_message_id",
+    "status",
+    "payload_json",
+    "attempts",
+    "error_type",
+    "error_message",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+)
+_GENERATION_JOB_SELECT = ", ".join(_GENERATION_JOB_COLUMNS)
 _STATE_OPTIONAL_FIELDS = (
     "active_problem_text",
     "active_image_context",
@@ -140,6 +162,27 @@ def _agent_run_from_row(row: sqlite3.Row) -> dict[str, Any]:
     ):
         data[name] = _json_loads(data[name])
     return data
+
+
+def _generation_job_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    data = _row_to_dict(row)
+    payload = GenerationJobPayload.model_validate(
+        _json_loads(data.pop("payload_json"))
+    )
+    data["status"] = GenerationJobStatus(data["status"])
+    data["payload"] = payload
+    return GenerationJob.model_validate(data).model_dump(mode="json")
+
+
+def _generation_job_status_value(
+    status: GenerationJobStatus | str,
+) -> str:
+    try:
+        return GenerationJobStatus(status).value
+    except (TypeError, ValueError) as exc:
+        raise RepositoryError("Generation Job 状态无效。") from exc
 
 
 @contextmanager
@@ -568,6 +611,402 @@ def get_agent_runs(
         raise RepositoryError("AgentRun 列表读取失败：数据库错误。") from exc
 
 
+def create_generation_job(
+    job: dict[str, Any],
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """创建 pending 后台回答 Job；同一会话只能存在一个活动 Job。"""
+    if not isinstance(job, dict):
+        raise RepositoryError("Generation Job 必须是字典。")
+    conversation_id = job.get("conversation_id")
+    user_message_id = job.get("user_message_id")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise RepositoryError("Generation Job 缺少 conversation_id。")
+    if not isinstance(user_message_id, str) or not user_message_id.strip():
+        raise RepositoryError("Generation Job 缺少 user_message_id。")
+    try:
+        payload = GenerationJobPayload.model_validate(job.get("payload"))
+    except ValidationError as exc:
+        raise RepositoryError("Generation Job payload 不合法。") from exc
+
+    job_id = job.get("id") or _new_id()
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise RepositoryError("Generation Job id 必须为非空字符串。")
+    created_at = job.get("created_at") or _utc_now_iso()
+    if not isinstance(created_at, str) or not created_at.strip():
+        raise RepositoryError("Generation Job created_at 必须为非空字符串。")
+    payload_json = json.dumps(payload.model_dump(mode="json"), ensure_ascii=False)
+    try:
+        with _connection(path) as conn:
+            conn.execute(
+                "INSERT INTO generation_jobs "
+                "(id, conversation_id, user_message_id, status, payload_json, "
+                "attempts, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?)",
+                (
+                    job_id,
+                    conversation_id,
+                    user_message_id,
+                    payload_json,
+                    created_at,
+                    created_at,
+                ),
+            )
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return _generation_job_from_row(row)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError(
+            "Generation Job 创建失败：会话、用户消息不存在或会话已有活动 Job。"
+        ) from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 创建失败：数据库错误。") from exc
+
+
+def enqueue_generation_job(
+    user_message: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """在同一事务中保存 user 消息和对应的 pending Generation Job。"""
+    now = _utc_now_iso()
+    try:
+        prepared_message = _prepare_message(user_message, now)
+        if prepared_message["role"] != "user":
+            raise ValueError("Generation Job 只能关联 user 消息。")
+        prepared_payload = GenerationJobPayload.model_validate(payload)
+    except (ValueError, ValidationError) as exc:
+        raise RepositoryError("Generation Job 入队参数不合法。") from exc
+
+    job_id = _new_id()
+    payload_json = json.dumps(
+        prepared_payload.model_dump(mode="json"),
+        ensure_ascii=False,
+    )
+    try:
+        with _connection(path) as conn:
+            _insert_message_on_conn(conn, prepared_message)
+            conn.execute(
+                "INSERT INTO generation_jobs "
+                "(id, conversation_id, user_message_id, status, payload_json, "
+                "attempts, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?)",
+                (
+                    job_id,
+                    prepared_message["conversation_id"],
+                    prepared_message["message_id"],
+                    payload_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            job = _generation_job_from_row(row)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError(
+            "Generation Job 入队失败：会话不存在或会话已有活动 Job。"
+        ) from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 入队失败：数据库错误。") from exc
+
+    return {
+        "user_message": {
+            "id": prepared_message["message_id"],
+            "conversation_id": prepared_message["conversation_id"],
+            "role": prepared_message["role"],
+            "display_content": prepared_message["display_content"],
+            "model_content": prepared_message["model_content"],
+            "image_metadata_json": user_message.get("image_metadata_json"),
+            "created_at": prepared_message["created_at"],
+        },
+        "generation_job": job,
+    }
+
+
+def get_generation_job(
+    job_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any] | None:
+    """按 ID 读取后台回答 Job；不存在时返回 None。"""
+    try:
+        with _connection(path) as conn:
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return _generation_job_from_row(row)
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("Generation Job 记录损坏。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 读取失败：数据库错误。") from exc
+
+
+def list_generation_jobs(
+    conversation_id: str | None = None,
+    *,
+    status: GenerationJobStatus | str | None = None,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """按创建顺序列出 Job，可按会话和状态过滤。"""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if conversation_id is not None:
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise RepositoryError("conversation_id 必须为非空字符串。")
+        clauses.append("conversation_id = ?")
+        params.append(conversation_id)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(_generation_job_status_value(status))
+    query = f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY created_at ASC, rowid ASC"
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [_generation_job_from_row(row) for row in rows]
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("Generation Job 列表包含损坏记录。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 列表读取失败：数据库错误。") from exc
+
+
+def get_active_generation_job(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any] | None:
+    """读取会话唯一的 pending/running Job。"""
+    try:
+        with _connection(path) as conn:
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs "
+                "WHERE conversation_id = ? AND status IN ('pending', 'running') "
+                "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            return _generation_job_from_row(row)
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("活动 Generation Job 记录损坏。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("活动 Generation Job 读取失败：数据库错误。") from exc
+
+
+def list_pending_generation_jobs(
+    limit: int = 100,
+    *,
+    path: DatabasePath | None = None,
+) -> list[dict[str, Any]]:
+    """按创建顺序列出待领取 Job。"""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise RepositoryError("limit 必须是正整数。")
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs "
+                "WHERE status = 'pending' "
+                "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [_generation_job_from_row(row) for row in rows]
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("待处理 Generation Job 列表包含损坏记录。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("待处理 Generation Job 读取失败：数据库错误。") from exc
+
+
+def claim_generation_job(
+    job_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any] | None:
+    """原子执行 pending → running；已被领取时返回 None。"""
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE generation_jobs SET status = 'running', "
+                "attempts = attempts + 1, started_at = ?, finished_at = NULL, "
+                "error_type = NULL, error_message = NULL, updated_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (now, now, job_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return _generation_job_from_row(row)
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("领取后的 Generation Job 记录损坏。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 领取失败：数据库错误。") from exc
+
+
+def _transition_running_job(
+    job_id: str,
+    target_status: GenerationJobStatus,
+    *,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE generation_jobs SET status = ?, error_type = ?, "
+                "error_message = ?, finished_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                (
+                    target_status.value,
+                    error_type,
+                    error_message,
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT status FROM generation_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if existing is None:
+                    raise RepositoryError("Generation Job 不存在。")
+                raise RepositoryError("Generation Job 不是 running，无法完成状态变更。")
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return _generation_job_from_row(row)
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("状态变更后的 Generation Job 记录损坏。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 状态更新失败：数据库错误。") from exc
+
+
+def complete_generation_job(
+    job_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """执行 running → completed。"""
+    return _transition_running_job(
+        job_id,
+        GenerationJobStatus.COMPLETED,
+        path=path,
+    )
+
+
+def fail_generation_job(
+    job_id: str,
+    error_type: str,
+    error_message: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """执行 running → failed，并保存简短安全错误摘要。"""
+    if not isinstance(error_type, str) or not error_type.strip():
+        raise RepositoryError("error_type 必须为非空字符串。")
+    if not isinstance(error_message, str) or not error_message.strip():
+        raise RepositoryError("error_message 必须为非空字符串。")
+    return _transition_running_job(
+        job_id,
+        GenerationJobStatus.FAILED,
+        error_type=error_type.strip(),
+        error_message=error_message.strip(),
+        path=path,
+    )
+
+
+def mark_running_interrupted(
+    *,
+    path: DatabasePath | None = None,
+) -> int:
+    """将进程遗留的全部 running Job 标记为 interrupted，返回数量。"""
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE generation_jobs SET status = 'interrupted', "
+                "error_type = 'worker_interrupted', "
+                "error_message = '回答生成被服务中断。', "
+                "finished_at = ?, updated_at = ? WHERE status = 'running'",
+                (now, now),
+            )
+            return cursor.rowcount
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 中断标记失败：数据库错误。") from exc
+
+
+def retry_generation_job(
+    job_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """仅执行 failed/interrupted → pending；保留累计 attempts。"""
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "UPDATE generation_jobs SET status = 'pending', "
+                "error_type = NULL, error_message = NULL, started_at = NULL, "
+                "finished_at = NULL, updated_at = ? "
+                "WHERE id = ? AND status IN ('failed', 'interrupted')",
+                (now, job_id),
+            )
+            if cursor.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT status FROM generation_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if existing is None:
+                    raise RepositoryError("Generation Job 不存在。")
+                raise RepositoryError("只有 failed/interrupted Job 可以重试。")
+            row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return _generation_job_from_row(row)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("Generation Job 重试失败：会话已有活动 Job。") from exc
+    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryError("重试后的 Generation Job 记录损坏。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 重试失败：数据库错误。") from exc
+
+
 def get_conversation_state(
     conversation_id: str,
     *,
@@ -706,6 +1145,86 @@ def finalize_conversation_turn(
         "user_message_id": run["user_message_id"],
         "assistant_message_id": assistant["message_id"],
         "agent_run_id": run["run_id"],
+    }
+
+
+def finalize_generation_job(
+    job_id: str,
+    conversation_id: str,
+    assistant_message: dict[str, Any],
+    agent_run: dict[str, Any],
+    conversation_state: dict[str, Any] | None = None,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """原子保存成功结果，并执行 running → completed。"""
+    now = _utc_now_iso()
+    try:
+        assistant = _prepare_message(assistant_message, now)
+        if assistant["conversation_id"] != conversation_id:
+            raise ValueError("assistant_message 的 conversation_id 与传入会话不一致。")
+        run = _prepare_agent_run(
+            agent_run,
+            now,
+            assistant_message_id=assistant["message_id"],
+        )
+        if run["conversation_id"] != conversation_id:
+            raise ValueError("agent_run 的 conversation_id 与传入会话不一致。")
+        state_sql: str | None = None
+        state_params: tuple[Any, ...] | None = None
+        if conversation_state is not None:
+            normalized_state = dict(conversation_state)
+            normalized_state["conversation_id"] = conversation_id
+            state_sql, state_params = _state_upsert_sql(normalized_state, now)
+    except ValueError as exc:
+        raise RepositoryError(str(exc)) from exc
+
+    try:
+        with _connection(path) as conn:
+            job_row = conn.execute(
+                "SELECT conversation_id, user_message_id, status "
+                "FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_row is None:
+                raise RepositoryError("Generation Job 不存在。")
+            if job_row["status"] != "running":
+                raise RepositoryError("Generation Job 不是 running，无法保存结果。")
+            if job_row["conversation_id"] != conversation_id:
+                raise RepositoryError("Generation Job 与会话不匹配。")
+            if run["user_message_id"] != job_row["user_message_id"]:
+                raise RepositoryError("AgentRun 与 Generation Job 的用户消息不匹配。")
+
+            _insert_message_on_conn(conn, assistant)
+            _insert_agent_run_on_conn(conn, run)
+            if state_sql is not None:
+                conn.execute(state_sql, state_params)
+            cursor = conn.execute(
+                "UPDATE generation_jobs SET status = 'completed', "
+                "error_type = NULL, error_message = NULL, finished_at = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'running'",
+                (now, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError("Generation Job 完成状态更新失败。")
+            completed_row = conn.execute(
+                f"SELECT {_GENERATION_JOB_SELECT} FROM generation_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            completed_job = _generation_job_from_row(completed_row)
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("Generation Job 结果保存失败：关联数据不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("Generation Job 结果保存失败：数据库错误。") from exc
+
+    return {
+        "conversation_id": conversation_id,
+        "user_message_id": run["user_message_id"],
+        "assistant_message_id": assistant["message_id"],
+        "agent_run_id": run["run_id"],
+        "generation_job": completed_job,
     }
 
 

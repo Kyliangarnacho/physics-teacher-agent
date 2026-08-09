@@ -12,7 +12,7 @@ from src.observability import RunTraceBuilder, StepTimer, create_skipped_step
 from src.prompts import MODE_INSTRUCTIONS
 from src.rag import retrieve_rag_context
 from src.router import route_question
-from src.schemas import RunStatus, StepStatus, StepTrace
+from src.schemas import ContextRelation, RunStatus, StepStatus, StepTrace
 from src.tool_client import answer_with_tools
 
 
@@ -163,6 +163,8 @@ def run_teacher_agent(
     conversation_history: list[dict[str, str]] | None = None,
     teaching_state_context: str | None = None,
     learning_memory_context: str | None = None,
+    previous_problem_text: str | None = None,
+    previous_image_context: str | None = None,
 ) -> dict[str, Any]:
     """分析、路由并回答一道初中物理问题。
 
@@ -186,21 +188,31 @@ def run_teacher_agent(
         str,
     ):
         raise ValueError("learning_memory_context 必须是字符串。")
+    if previous_problem_text is not None and not isinstance(
+        previous_problem_text,
+        str,
+    ):
+        raise ValueError("previous_problem_text 必须是字符串。")
+    if previous_image_context is not None and not isinstance(
+        previous_image_context,
+        str,
+    ):
+        raise ValueError("previous_image_context 必须是字符串。")
     if image_context_available and (
         not isinstance(image_context, str) or not image_context.strip()
     ):
         raise ValueError("图片上下文已标记为可用时，image_context 不能为空。")
 
     normalized_question = question.strip()
-    active_question = normalized_question
+    analysis_question = normalized_question
     if image_context_available:
-        active_question = (
+        analysis_question = (
             f"用户要求：\n{normalized_question}\n\n"
             f"已确认图片上下文：\n{image_context.strip()}"
         )
     trace_builder = RunTraceBuilder(case_id=case_id)
     analysis, analysis_fallback, analyzer_trace = analyze_question_with_trace(
-        active_question,
+        analysis_question,
         analyze_func=analyzer_func,
         teaching_state_context=teaching_state_context,
         learning_memory_context=learning_memory_context,
@@ -208,12 +220,53 @@ def run_teacher_agent(
     )
     trace_builder.add_step(analyzer_trace)
 
+    relation = analysis.context_relation
+    can_inherit_previous = relation in {
+        ContextRelation.FOLLOW_UP,
+        ContextRelation.UNCERTAIN,
+    }
+    inherited_problem = (
+        previous_problem_text.strip()
+        if can_inherit_previous
+        and isinstance(previous_problem_text, str)
+        and previous_problem_text.strip()
+        else None
+    )
+    inherited_image = (
+        previous_image_context.strip()
+        if not image_context_available
+        and can_inherit_previous
+        and isinstance(previous_image_context, str)
+        and previous_image_context.strip()
+        and (
+            analysis.needs_previous_image_context
+            or relation is ContextRelation.UNCERTAIN
+            or analysis.image_required
+        )
+        else None
+    )
+    effective_image_context = (
+        image_context.strip() if image_context_available else inherited_image
+    )
+    effective_image_available = bool(effective_image_context)
+
+    active_question = normalized_question
+    if image_context_available:
+        active_question = analysis_question
+    elif inherited_problem or inherited_image:
+        sections = [f"当前指令：\n{normalized_question}"]
+        if inherited_problem:
+            sections.append(f"上一活动题目：\n{inherited_problem}")
+        if inherited_image:
+            sections.append(f"上一题已确认图片上下文：\n{inherited_image}")
+        active_question = "\n\n".join(sections)
+
     router_timer = StepTimer("router")
     route = route_question(
         analysis,
         mode_override=mode_override,
         rag_policy=rag_policy,
-        image_context_available=image_context_available,
+        image_context_available=effective_image_available,
     )
     trace_builder.add_step(
         router_timer.finish(
@@ -292,10 +345,10 @@ def run_teacher_agent(
 
     if route.use_tools:
         separate_multi_image_questions = (
-            image_context_available
+            effective_image_available
             and _requires_multiple_independent_answers(
                 normalized_question,
-                image_context,
+                effective_image_context,
             )
         )
         if separate_multi_image_questions:
@@ -359,11 +412,11 @@ def run_teacher_agent(
             tool_fallback = bool(
                 model_only_tool_fallback
                 or (
-                    image_context_available
+                    effective_image_available
                     and recoverable_tool_error is not None
                 )
             )
-            if image_context_available and recoverable_tool_error is not None:
+            if effective_image_available and recoverable_tool_error is not None:
                 fallback_timer = StepTimer("final_answer")
                 answer = _invoke_with_context(
                     active_answer_func,

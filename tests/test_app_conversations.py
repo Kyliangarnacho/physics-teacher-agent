@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from src.storage import (
@@ -24,6 +25,7 @@ from src.storage import (
     list_messages,
 )
 from src.vision.schemas import ImageQuestionExtraction
+from tests.app_task_manager import ImmediateGenerationTaskManager
 
 
 def fake_agent_result(
@@ -99,14 +101,26 @@ def service_result(name: str = "image") -> dict:
 
 class AppConversationTests(unittest.TestCase):
     def setUp(self) -> None:
+        st.cache_resource.clear()
+        self._manager_patch = patch(
+            "src.tasks.GenerationTaskManager",
+            ImmediateGenerationTaskManager,
+        )
+        self._manager_patch.start()
+        self.addCleanup(self._manager_patch.stop)
+        self.addCleanup(st.cache_resource.clear)
         self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self.db_path = str(Path(self._temp_dir.name) / "physics_teacher.db")
         os.environ["PHYSICS_AGENT_DB_PATH"] = self.db_path
+        os.environ["PHYSICS_AGENT_ATTACHMENT_ROOT"] = str(
+            Path(self._temp_dir.name) / "attachments"
+        )
         initialize_database(self.db_path)
 
     def tearDown(self) -> None:
         os.environ.pop("PHYSICS_AGENT_DB_PATH", None)
+        os.environ.pop("PHYSICS_AGENT_ATTACHMENT_ROOT", None)
 
     def run_app(self, *, current_conversation_id=None) -> AppTest:
         app = AppTest.from_file("app.py")
@@ -134,18 +148,13 @@ class AppConversationTests(unittest.TestCase):
     def submit(self, app: AppTest, text: str) -> None:
         app.chat_input[0].set_value(text).run()
 
-    def test_first_startup_creates_db_and_first_conversation(self) -> None:
+    def test_first_startup_stays_in_unpersisted_draft(self) -> None:
         app = self.run_app()
 
         self.assertEqual(len(app.exception), 0)
         self.assertIn("current_conversation_id", app.session_state)
-        conversations = list_conversations()
-        self.assertEqual(len(conversations), 1)
-        self.assertEqual(
-            conversations[0]["id"],
-            app.session_state["current_conversation_id"],
-        )
-        self.assertEqual(list_messages(conversations[0]["id"]), [])
+        self.assertIsNone(app.session_state["current_conversation_id"])
+        self.assertEqual(list_conversations(), [])
 
     def test_conversation_list_sorted_and_new_conversation(self) -> None:
         first = create_conversation("第一个", path=self.db_path)
@@ -164,11 +173,8 @@ class AppConversationTests(unittest.TestCase):
         self.button_by_key(app, "new_conversation").click().run()
 
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(len(list_conversations()), 3)
-        self.assertEqual(
-            app.session_state["current_conversation_id"],
-            list_conversations()[0]["id"],
-        )
+        self.assertEqual(len(list_conversations()), 2)
+        self.assertIsNone(app.session_state["current_conversation_id"])
 
     def test_switch_conversation_shows_its_own_history(self) -> None:
         conv_a = create_conversation("A", path=self.db_path)
@@ -200,7 +206,7 @@ class AppConversationTests(unittest.TestCase):
         )
         self.assertEqual(len(app.exception), 0)
 
-    def test_delete_current_conversation_selects_remaining(self) -> None:
+    def test_delete_current_conversation_returns_to_draft(self) -> None:
         conv_a = create_conversation("A", path=self.db_path)
         conv_b = create_conversation("B", path=self.db_path)
         with self.patch_agent():
@@ -209,10 +215,20 @@ class AppConversationTests(unittest.TestCase):
 
         self.button_by_key(app, f"delete_conv_{conv_a['id']}").click().run()
 
-        self.assertEqual(app.session_state["current_conversation_id"], conv_b["id"])
+        self.assertIsNone(app.session_state["current_conversation_id"])
         self.assertIsNone(get_conversation(conv_a["id"], path=self.db_path))
         self.assertEqual(len(list_messages(conv_b["id"], path=self.db_path)), 0)
         self.assertEqual(len(app.exception), 0)
+
+    def test_draft_first_send_creates_conversation_once(self) -> None:
+        with self.patch_agent():
+            app = self.run_app()
+            self.assertEqual(list_conversations(), [])
+            self.submit(app, "第一条真正消息")
+        self.assertEqual(len(list_conversations()), 1)
+        conversation_id = app.session_state["current_conversation_id"]
+        self.assertIsNotNone(conversation_id)
+        self.assertEqual(len(list_messages(conversation_id)), 2)
 
     def test_history_restored_on_new_session(self) -> None:
         with self.patch_agent():
@@ -255,6 +271,27 @@ class AppConversationTests(unittest.TestCase):
         self.assertIn("显示版回答", rendered)
         self.assertNotIn("模型版问题", rendered)
         self.assertNotIn("模型版回答", rendered)
+
+    def test_current_conversation_outline_lists_more_than_three_anchors(self) -> None:
+        conv = create_conversation("长对话", path=self.db_path)
+        message_ids = []
+        for index in range(6):
+            stored = insert_message(
+                {
+                    "conversation_id": conv["id"],
+                    "role": "user",
+                    "display_content": f"目录问题 {index}",
+                    "model_content": f"目录问题 {index}",
+                },
+                path=self.db_path,
+            )
+            message_ids.append(stored["id"])
+        app = self.run_app(current_conversation_id=conv["id"])
+        rendered = "\n".join(str(item.value) for item in app.markdown)
+        for index, message_id in enumerate(message_ids):
+            self.assertIn(f"目录问题 {index}", rendered)
+            self.assertIn(f"#message-{message_id}", rendered)
+        self.assertEqual(len(app.exception), 0)
 
     def test_user_and_assistant_saved_exactly_once(self) -> None:
         with self.patch_agent():

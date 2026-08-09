@@ -14,6 +14,7 @@ from src.storage import (
     create_conversation,
     get_agent_runs,
     get_conversation_state,
+    list_generation_jobs,
     initialize_database,
     list_messages,
 )
@@ -146,6 +147,22 @@ class ConversationServiceTests(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state["hint_step"], 0)
         self.assertEqual(state["teaching_mode"], "solve")
+
+    def test_image_only_keeps_display_empty_but_model_question_non_empty(self) -> None:
+        agent = FakeAgent()
+        run_conversation_turn(
+            self.conversation_id,
+            "",
+            "请根据已确认图片上下文分析并解答。",
+            image_metadata={"image_count": 1, "attachments": []},
+            confirmed_image_context="题干：求电流。",
+            db_path=self.db_path,
+            agent_func=agent,
+        )
+        messages = list_messages(self.conversation_id, path=self.db_path)
+        self.assertEqual(messages[0]["display_content"], "")
+        self.assertTrue(messages[0]["model_content"])
+        self.assertIn("请根据已确认", agent.calls[0]["question"])
 
     def test_second_turn_reads_first_turn_history(self) -> None:
         agent = FakeAgent(
@@ -288,7 +305,7 @@ class ConversationServiceTests(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertEqual(runs[1]["status"], "blocked")
 
-    def test_agent_exception_keeps_user_and_records_failed_run(self) -> None:
+    def test_agent_exception_keeps_user_and_marks_job_failed(self) -> None:
         agent = FakeAgent(error=RuntimeError("boom"))
 
         with self.assertRaises(ConversationServiceError):
@@ -304,8 +321,13 @@ class ConversationServiceTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["role"], "user")
         runs = get_agent_runs(self.conversation_id, path=self.db_path)
-        self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0]["status"], "failed")
+        self.assertEqual(runs, [])
+        jobs = list_generation_jobs(
+            self.conversation_id,
+            path=self.db_path,
+        )
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "failed")
         self.assertIsNone(get_conversation_state(self.conversation_id, path=self.db_path))
 
     def test_finalize_failure_rolls_back_but_keeps_user(self) -> None:
@@ -313,7 +335,7 @@ class ConversationServiceTests(unittest.TestCase):
             raise RepositoryError("会话轮次保存失败：数据库错误。")
 
         with mock.patch(
-            "src.conversation.service.finalize_conversation_turn",
+            "src.conversation.service.finalize_generation_job",
             failing_finalize,
         ):
             with self.assertRaises(ConversationServiceError):

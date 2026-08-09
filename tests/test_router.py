@@ -50,6 +50,18 @@ class RouteQuestionTests(unittest.TestCase):
 
         self.assertFalse(decision.use_rag)
 
+    def test_non_physics_analysis_uses_neither_physics_rag_nor_tools(self) -> None:
+        decision = route_question(
+            make_analysis(
+                physics_topic="非物理",
+                needs_rag=False,
+                calculation_required=False,
+            )
+        )
+        self.assertFalse(decision.use_rag)
+        self.assertFalse(decision.use_tools)
+        self.assertTrue(decision.should_answer)
+
     def test_force_rag_enables_rag(self) -> None:
         decision = route_question(
             make_analysis(needs_rag=False),

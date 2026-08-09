@@ -2,9 +2,9 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 11.1：在 Stage 10
-的持久会话、教学状态与长期记忆基础上，扩展为具备有限多工具编排和公开工具适用性评测的
-本地物理计算 Agent。当前文本模型为 `qwen3.7-flash`，提示词版本仍为
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 11.2：在持久会话、
+长期记忆与有限多工具编排基础上，加入后台多会话生成、恢复/重试和图片上下文体验。当前文本模型为
+`qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。
 
 ## 环境与配置
@@ -22,8 +22,8 @@
 
 ## 代码职责
 
-- `app.py`：提供 Streamlit 文本/多图片聊天页面，调用视觉服务和统一 Agent，并保存安全的
-  回答、决策、来源、工具记录和 Trace
+- `app.py`：提供 Streamlit 文本/多图片聊天页面，先同步完成视觉识别/确认，再将教师回答交给
+  后台 Generation Job；页面保存安全的回答、决策、来源、工具记录和 Trace
 - `main.py`：运行固定平均速度题，作为终端回归入口
 - `src/config.py`：加载并校验 `.env` 中的千问配置
 - `src/schemas.py`：定义 `TeachingMode`、带 `calculation_required` 的
@@ -43,11 +43,12 @@
   repair、partial success 与安全 Model-only fallback
 - `src/observability.py`：构建步骤 Trace、整次 AgentRunTrace，并统一记录安全错误类型
 - `src/retry.py`：提供至多重试一次的通用有限 Retry，不负责业务错误分类
-- `src/vision/`：负责图片内存预处理、视觉提取、可选 OCR、结果合并、多图 Batch 与安全上下文
+- `src/vision/`：负责图片内存预处理、视觉提取、可选 OCR、多图关系融合与安全上下文
 - `src/ui/paste_images.py`：提供图片粘贴辅助与哈希去重；页面同时保留原生附件上传能力
-- `src/storage/`：SQLite 连接、Migration V1（五张表）与 Repository 数据访问层
-- `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析与 Conversation Service
-- `src/memory/`：长期记忆候选提取、确认、检索与模型注入
+- `src/storage/`：SQLite 短连接、Migration V1～V3、消息附件、Generation Job 与 Repository 数据访问层
+- `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析，以及 enqueue/execute 分离的服务
+- `src/tasks/`：固定两个 Worker 的 GenerationTaskManager 与独立的单 Worker 学习表现分析任务管理器
+- `src/memory/`：长期记忆候选提取、确认、检索、模型注入与异步学习表现分析
 - `scripts/probe_stage09_vision.py`：人工验证视觉模型、多模态消息和结构化提取能力
 - `scripts/probe_stage07_function_calling.py`：人工验证底层 Function Calling 兼容链路
 - `scripts/probe_stage07_agent_e2e.py`：人工验证统一 Agent 的真实工具端到端链路
@@ -96,6 +97,19 @@ Stage 11.1 当前实现：
   请求数；本地 Registry 执行不计入模型请求。
 - 已建立 24 条公开工具适用性评测。正式规则复测的 precision 为 92.3%、recall 为 80.0%、
   no-tool 正确率为 83.3%、多工具完整命中率为 100%，并保留 1 次误调用作为当前限制。
+
+## Stage 11.2 后台会话与图片体验
+
+- 用户提问先原子写入 user message 与 pending Generation Job，随后由进程内两个 Worker 后台执行；
+  不同会话可并发生成，页面可立即切换会话。
+- Job 支持 `pending`、`running`、`completed`、`failed`、`interrupted`；启动会将遗留 running
+  标为 interrupted、自动恢复 pending，并允许对 failed/interrupted 原 Job 人工 Retry。
+- 原图以受控本地附件文件保存，SQLite 仅保存附件 ID、相对路径、MIME、文件名和哈希；生成 Job
+  只保存确认后的图片文本上下文，不保存图片 bytes、Base64 或 Data URL。
+- 同批最多三张图片会先逐张提取，再判断是否属于同一道题并融合题干、图示、选项或小问；不确定时
+  仍要求人工确认。跨轮图片承接由既有 Analyzer 的语义关系判断，不额外增加一次模型调用。
+- “分析本轮学习表现”使用独立单 Worker 后台任务，不占用 Generation Job Worker；候选确认、忽略和
+  长期记忆写入的既有行为保持不变。
 
 ## Stage 09 图片理解与多图聊天
 
@@ -277,6 +291,8 @@ API 配置与费用时执行。
 
 每次模型请求会注入最近完整轮次（最多 3 轮、6000 字符）、已确认的教学状态，以及
 `confirmed=1` 且 `active=1` 的长期记忆；当前问题始终是最后一条 user 消息。
+打开页面或点击“新建对话”时先处于未持久化 draft，只有首次发送消息才创建 SQLite 会话；因此重连
+不会额外产生空会话。Generation Job、会话状态和结果均按 conversation ID 隔离。
 
 ## 已完成验证
 
@@ -292,7 +308,7 @@ API 配置与费用时执行。
   `content`
 - Stage 05 知识库 10 条卡片通过结构与唯一性校验
 - 检索、RAG 编排和 context 消息均由 fake/mock 测试覆盖，不调用千问
-- 当前全部单元测试为 608 项，全部通过
+- 当前全部单元测试为 680 项，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，页面与终端没有出现应用 traceback
 - 已真实验证电热器和凸透镜 RAG 问答；加入相对分数过滤后再次验证电热器问题，网页来源
   只返回 `KB-POWER-001`
@@ -310,8 +326,8 @@ API 配置与费用时执行。
 - Stage 08 的 8 道真实 Agent 评测只运行一轮：7 题完成、1 题缺图拦截、0 题失败，预期路由
   匹配 5/8；总模型请求 18 次、RAG 检索 4 次、本地工具执行 3 次，无 fallback、Retry 或空回答
 - Stage 08 Streamlit Trace 专项测试通过，服务启动检查返回 HTTP 200
-- Stage 09 单图、多图、可选 OCR、自适应确认、图片上下文进入 RAG/Tool、附件与粘贴去重均有
-  本地测试覆盖；完整回归为 581/581
+- Stage 09/11.2 单图、多图、可选 OCR、自适应确认、批内同题融合、图片附件恢复与跨轮图片
+  上下文继承均有本地测试覆盖
 - Stage 10 SQLite 会话、多会话管理、重启恢复、历史/状态/记忆注入、长期记忆页面交互
   均有本地测试覆盖；真实探针验证两轮会话与记忆确认/停用，Streamlit HTTP 200
 
@@ -343,5 +359,9 @@ Stage 08 的 8 道题只覆盖代表性工程路径，不是完整初中物理�
 长期记忆检索目前是关键词确定性近似。未确认候选只存在 `session_state`；暂无重新启用
 长期记忆的页面操作；V1 没有单独持久化 assistant 的 analysis 字段。
 图片理解依赖视觉模型输出，模糊文字、手写内容和复杂图形仍可能需要人工确认；一次提交最多
-3 张图片，OCR 仅在已配置可用模型时启用。知识库仍只有 10 条文本卡片，BM25 覆盖有限；
-尚未实现向量检索、MCP、微调或通用跨图片语义推理。
+3 张图片，OCR 仅在已配置可用模型时启用。当前仅提供同批图片的有限关系融合，不具备通用视觉
+推理。知识库仍只有 10 条文本卡片，BM25 覆盖有限；尚未实现向量检索、MCP 或微调。
+
+后台任务是单进程线程池，不是分布式队列；进程退出时遗留 running Job 会在下次启动时标记为
+interrupted，需人工 Retry。近期 history 仍固定为最多 3 个完整轮次、6000 字符，尚未实现长期
+上下文管理。
