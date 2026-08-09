@@ -472,6 +472,10 @@ class AppImageFlowTests(unittest.TestCase):
 
     def test_native_attachment_preview_grows_left_to_right(self) -> None:
         source = Path("app.py").read_text(encoding="utf-8")
+        chat_input_parent_rule = source.split(
+            '[data-testid="stChatInput"] > div {',
+            1,
+        )[1].split("}", 1)[0]
         container_rule = source.split(
             '[data-testid="stChatInput"] [data-testid="stFileChips"]',
             1,
@@ -481,6 +485,8 @@ class AppImageFlowTests(unittest.TestCase):
             1,
         )[1].split("}", 1)[0]
 
+        self.assertIn("align-items: stretch", chat_input_parent_rule)
+        self.assertNotIn("align-items: flex-end", chat_input_parent_rule)
         self.assertIn("flex-flow: row wrap", container_rule)
         self.assertIn("justify-content: flex-start", container_rule)
         self.assertIn("align-self: stretch", container_rule)

@@ -138,7 +138,7 @@ APP_STYLES = """
 
 [data-testid="stChatInput"] > div {
     border-radius: inherit !important;
-    align-items: flex-end;
+    align-items: stretch;
 }
 
 [data-testid="stChatInput"] textarea {
