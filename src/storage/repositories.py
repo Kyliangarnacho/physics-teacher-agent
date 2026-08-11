@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from src.context.schemas import ConversationSummary
 from src.storage.schemas import (
     GenerationJob,
     GenerationJobPayload,
@@ -100,6 +101,17 @@ _GENERATION_JOB_COLUMNS = (
     "finished_at",
 )
 _GENERATION_JOB_SELECT = ", ".join(_GENERATION_JOB_COLUMNS)
+_CONVERSATION_SUMMARY_COLUMNS = (
+    "conversation_id",
+    "summary_text",
+    "covered_until_message_id",
+    "covered_turn_count",
+    "summary_revision",
+    "model_name",
+    "created_at",
+    "updated_at",
+)
+_CONVERSATION_SUMMARY_SELECT = ", ".join(_CONVERSATION_SUMMARY_COLUMNS)
 _STATE_OPTIONAL_FIELDS = (
     "active_problem_text",
     "active_image_context",
@@ -174,6 +186,38 @@ def _generation_job_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     data["status"] = GenerationJobStatus(data["status"])
     data["payload"] = payload
     return GenerationJob.model_validate(data).model_dump(mode="json")
+
+
+def _conversation_summary_from_row(
+    row: sqlite3.Row | None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return ConversationSummary.model_validate(
+        _row_to_dict(row)
+    ).model_dump(mode="json")
+
+
+def _validate_summary_upsert_input(
+    conversation_id: object,
+    summary_text: object,
+    covered_until_message_id: object,
+    covered_turn_count: object,
+    model_name: object,
+) -> ConversationSummary:
+    """用公开数据合同校验 upsert 输入；时间与 revision 由 Repository 管理。"""
+    return ConversationSummary.model_validate(
+        {
+            "conversation_id": conversation_id,
+            "summary_text": summary_text,
+            "covered_until_message_id": covered_until_message_id,
+            "covered_turn_count": covered_turn_count,
+            "summary_revision": 1,
+            "model_name": model_name,
+            "created_at": "repository-managed",
+            "updated_at": "repository-managed",
+        }
+    )
 
 
 def _generation_job_status_value(
@@ -312,8 +356,10 @@ def delete_conversation(
     *,
     path: DatabasePath | None = None,
 ) -> bool:
-    """删除会话；messages/agent_runs/conversation_states 由外键级联删除，
-    learning_memories 不受影响。返回是否删除成功。"""
+    """删除会话；消息、运行、状态和摘要由外键级联删除。
+
+    learning_memories 不受影响。返回是否删除成功。
+    """
     try:
         with _connection(path) as conn:
             cursor = conn.execute(
@@ -325,6 +371,116 @@ def delete_conversation(
         raise
     except (sqlite3.Error, OSError) as exc:
         raise RepositoryError("会话删除失败：数据库错误。") from exc
+
+
+def get_conversation_summary(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> dict[str, Any] | None:
+    """读取会话摘要；不存在时返回 None。"""
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise RepositoryError("conversation_id 必须为非空字符串。")
+    try:
+        with _connection(path) as conn:
+            row = conn.execute(
+                f"SELECT {_CONVERSATION_SUMMARY_SELECT} "
+                "FROM conversation_summaries WHERE conversation_id = ?",
+                (conversation_id.strip(),),
+            ).fetchone()
+            return _conversation_summary_from_row(row)
+    except (ValidationError, ValueError) as exc:
+        raise RepositoryError("会话摘要记录损坏。") from exc
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话摘要读取失败：数据库错误。") from exc
+
+
+def upsert_conversation_summary(
+    conversation_id: str,
+    summary_text: str,
+    *,
+    covered_until_message_id: str | None = None,
+    covered_turn_count: int = 0,
+    model_name: str | None = None,
+    path: DatabasePath | None = None,
+) -> dict[str, Any]:
+    """新增或更新会话摘要，并由数据库原子维护 revision。"""
+    try:
+        summary = _validate_summary_upsert_input(
+            conversation_id,
+            summary_text,
+            covered_until_message_id,
+            covered_turn_count,
+            model_name,
+        )
+    except ValidationError as exc:
+        raise RepositoryError("会话摘要参数不合法。") from exc
+
+    now = _utc_now_iso()
+    try:
+        with _connection(path) as conn:
+            conn.execute(
+                "INSERT INTO conversation_summaries "
+                "(conversation_id, summary_text, covered_until_message_id, "
+                "covered_turn_count, summary_revision, model_name, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                "summary_text = excluded.summary_text, "
+                "covered_until_message_id = excluded.covered_until_message_id, "
+                "covered_turn_count = excluded.covered_turn_count, "
+                "summary_revision = conversation_summaries.summary_revision + 1, "
+                "model_name = excluded.model_name, "
+                "updated_at = excluded.updated_at",
+                (
+                    summary.conversation_id,
+                    summary.summary_text,
+                    summary.covered_until_message_id,
+                    summary.covered_turn_count,
+                    summary.model_name,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                f"SELECT {_CONVERSATION_SUMMARY_SELECT} "
+                "FROM conversation_summaries WHERE conversation_id = ?",
+                (summary.conversation_id,),
+            ).fetchone()
+            result = _conversation_summary_from_row(row)
+            if result is None:
+                raise RepositoryError("会话摘要保存后未找到记录。")
+            return result
+    except RepositoryError:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise RepositoryError("会话摘要保存失败：会话不存在。") from exc
+    except (ValidationError, ValueError) as exc:
+        raise RepositoryError("会话摘要保存后记录不合法。") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话摘要保存失败：数据库错误。") from exc
+
+
+def delete_conversation_summary(
+    conversation_id: str,
+    *,
+    path: DatabasePath | None = None,
+) -> bool:
+    """删除一个会话摘要；返回是否删除成功。"""
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise RepositoryError("conversation_id 必须为非空字符串。")
+    try:
+        with _connection(path) as conn:
+            cursor = conn.execute(
+                "DELETE FROM conversation_summaries WHERE conversation_id = ?",
+                (conversation_id.strip(),),
+            )
+            return cursor.rowcount > 0
+    except RepositoryError:
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        raise RepositoryError("会话摘要删除失败：数据库错误。") from exc
 
 
 def _prepare_message(
@@ -1233,7 +1389,7 @@ def clear_conversation_contents(
     *,
     path: DatabasePath | None = None,
 ) -> bool:
-    """在一个事务内清空会话的消息、agent_runs 与状态，但保留 conversation 行。
+    """在一个事务内清空消息、运行、状态和摘要，但保留 conversation 行。
 
     返回会话是否存在；不存在时不做任何删除并返回 False。
     """
@@ -1256,6 +1412,10 @@ def clear_conversation_contents(
             )
             conn.execute(
                 "DELETE FROM conversation_states WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM conversation_summaries WHERE conversation_id = ?",
                 (conversation_id,),
             )
             return True

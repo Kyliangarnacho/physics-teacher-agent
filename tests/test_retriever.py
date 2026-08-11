@@ -7,7 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.retriever import KnowledgeRetriever, load_knowledge_base
+from src.retriever import (
+    MIN_ABSOLUTE_RETRIEVAL_SCORE,
+    KnowledgeRetriever,
+    load_knowledge_base,
+)
 
 
 EXPECTED_CARD_FIELDS = {
@@ -84,10 +88,19 @@ class KnowledgeRetrieverTests(unittest.TestCase):
                 self.assertTrue(
                     all(result["score"] >= threshold for result in results)
                 )
+                self.assertGreaterEqual(
+                    results[0]["score"], MIN_ABSOLUTE_RETRIEVAL_SCORE
+                )
 
     def test_unrelated_question_returns_empty_list(self) -> None:
         self.assertEqual(
             self.retriever.search("企鹅在南极怎样孵蛋？"),
+            [],
+        )
+
+    def test_weak_positive_overlap_does_not_return_garbage_cards(self) -> None:
+        self.assertEqual(
+            self.retriever.search("\u7535\u8def\u600e\u6837\u53d8\u5316"),
             [],
         )
 

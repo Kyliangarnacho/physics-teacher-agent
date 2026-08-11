@@ -2,8 +2,9 @@
 
 ## 项目定位
 
-本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 11.2：在持久会话、
-长期记忆与有限多工具编排基础上，加入后台多会话生成、恢复/重试和图片上下文体验。当前文本模型为
+本项目是“初中物理教师 Agent + 阿里云百炼千问 API”。当前已完成 Stage 11.3：在持久会话、
+长期记忆、后台多会话生成与图片上下文基础上，加入滚动摘要、旧历史检索、统一上下文预算和
+按消费者投影。当前文本模型为
 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。
 
@@ -45,9 +46,12 @@
 - `src/retry.py`：提供至多重试一次的通用有限 Retry，不负责业务错误分类
 - `src/vision/`：负责图片内存预处理、视觉提取、可选 OCR、多图关系融合与安全上下文
 - `src/ui/paste_images.py`：提供图片粘贴辅助与哈希去重；页面同时保留原生附件上传能力
-- `src/storage/`：SQLite 短连接、Migration V1～V3、消息附件、Generation Job 与 Repository 数据访问层
+- `src/storage/`：SQLite 短连接、Migration V1～V4、消息附件、Generation Job、Summary 与 Repository 数据访问层
 - `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析，以及 enqueue/execute 分离的服务
-- `src/tasks/`：固定两个 Worker 的 GenerationTaskManager 与独立的单 Worker 学习表现分析任务管理器
+- `src/context/`：Rolling Summary、Bridge/Recent 窗口、会话内 BM25 历史检索、Context Budget、
+  ContextBundle 与 Analyzer/Tool/Final Projection
+- `src/tasks/`：固定两个 Worker 的 GenerationTaskManager，以及独立单 Worker 的学习表现分析和
+  Context Maintenance 管理器
 - `src/memory/`：长期记忆候选提取、确认、检索、模型注入与异步学习表现分析
 - `scripts/probe_stage09_vision.py`：人工验证视觉模型、多模态消息和结构化提取能力
 - `scripts/probe_stage07_function_calling.py`：人工验证底层 Function Calling 兼容链路
@@ -110,6 +114,24 @@ Stage 11.1 当前实现：
   仍要求人工确认。跨轮图片承接由既有 Analyzer 的语义关系判断，不额外增加一次模型调用。
 - “分析本轮学习表现”使用独立单 Worker 后台任务，不占用 Generation Job Worker；候选确认、忽略和
   长期记忆写入的既有行为保持不变。
+
+## Stage 11.3 长期上下文工程
+
+- 完整历史按 `Rolling Summary + Unsummarized Bridge + Recent 3 turns` 连续覆盖；Summary 尚未
+  成功更新时，Bridge 继续以原文进入上下文，不产生历史空洞。
+- History Retrieval 只检索当前 conversation 中已被 Summary 覆盖的完整旧轮次，并排除 Bridge、
+  Recent、未完成 Job 和不安全内容；使用本地 `jieba + BM25` 的有效词重合、绝对相关门槛、
+  相对门槛与 `top_k=2` 两级过滤，无相关历史时返回空。
+- Context Manager 每个 Generation 只构造一次不可变语义的 ContextBundle；确定性字符预算优先保护
+  当前题状态、Recent 与 Bridge，再依次裁剪 Retrieved、Learning Memory 和 Summary，并记录裁剪元数据。
+- 同一 Bundle 投影为 Analyzer/Final 宽视图与 Tool 窄视图。当前用户问题是本轮唯一任务；历史仅用于
+  消歧、条件恢复与连续性，Tool View 不携带 Learning Memory。
+- Generation 完成后只做轻量 maintenance submit；独立单 Worker 在后台重新判断 stale 并滚动更新
+  Summary。Summary 失败不影响已完成回答，Generation Future 异常会落成终态并保留 Retry 能力。
+- Trace 只持久化 Summary revision、Bridge/Recent/Retrieved 数量、预算与 Projection 字符数等统计，
+  不保存完整上下文、长期记忆原文、原图或内部 Tool 协议。
+
+完整阶段记录见 `docs/STAGE11_3_CONTEXT_ENGINEERING.md`。
 
 ## Stage 09 图片理解与多图聊天
 
@@ -186,8 +208,8 @@ Analyzer 返回非法 JSON、字段不合法或调用异常时不重试，而是
 知识库当前包含 10 条卡片，覆盖欧姆定律与动态电路、电功率、光学、实验与易错点。检索器
 将每张卡片的 `chapter`、`topic`、`keywords` 和 `content` 合并后分词建索引。
 
-默认检索参数为 `top_k=3` 和 `min_score_ratio=0.3`：先保留 BM25 正分结果，再删除低于
-最高分 30% 的卡片，最后限制返回数量。完全没有正相关分数时返回空结果。
+默认检索参数为 `top_k=3` 和 `min_score_ratio=0.3`：最高候选先通过项目内部绝对相关门槛，
+再删除低于最高分 30% 的卡片，最后限制返回数量。最高候选本身不相关时直接返回空结果。
 
 普通问答数据流：
 
@@ -240,7 +262,7 @@ S04-TXT-001 已由用户人工评分为 7/8，其余题目的人工评分仍待�
 
 - 教学模式：自动判断、完整解题、概念讲解、只给提示、错误诊断。
 - 知识库策略：自动决定、强制使用、不使用。
-- 自动决定或强制使用 RAG 时，最多选取 3 条达到相对阈值的资料。
+- 自动决定或强制使用 RAG 时，最多选取 3 条同时达到绝对与相对阈值的资料。
 - 有来源：在回答下方的折叠区域显示知识卡片 ID、主题和原始文件名。
 - 无来源：提示本次按普通问答处理。
 - 每条新回答还保存并显示最终教学模式、物理主题、问题类型、RAG 决策、简短理由和
@@ -289,8 +311,9 @@ API 配置与费用时执行。
 支持新建、切换、重命名、清空（保留会话）与删除会话；浏览器新会话或服务重启后，
 历史从 SQLite 恢复。
 
-每次模型请求会注入最近完整轮次（最多 3 轮、6000 字符）、已确认的教学状态，以及
-`confirmed=1` 且 `active=1` 的长期记忆；当前问题始终是最后一条 user 消息。
+每个 Generation 只构造一次 ContextBundle，组合 Summary、尚未覆盖的 Bridge、最近 3 个完整轮次、
+可选旧历史召回、已确认教学状态和相关的 confirmed/active Learning Memory。Analyzer、Tool、Final
+从同一快照取得各自 Projection；当前问题始终是最后一条 user 消息和本轮唯一执行目标。
 打开页面或点击“新建对话”时先处于未持久化 draft，只有首次发送消息才创建 SQLite 会话；因此重连
 不会额外产生空会话。Generation Job、会话状态和结果均按 conversation ID 隔离。
 
@@ -308,7 +331,7 @@ API 配置与费用时执行。
   `content`
 - Stage 05 知识库 10 条卡片通过结构与唯一性校验
 - 检索、RAG 编排和 context 消息均由 fake/mock 测试覆盖，不调用千问
-- 当前全部单元测试为 680 项，全部通过
+- 当前全部单元测试为 794 项，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，页面与终端没有出现应用 traceback
 - 已真实验证电热器和凸透镜 RAG 问答；加入相对分数过滤后再次验证电热器问题，网页来源
   只返回 `KB-POWER-001`

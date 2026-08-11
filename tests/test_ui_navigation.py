@@ -24,6 +24,12 @@ class UiNavigationTests(unittest.TestCase):
         self.assertIn("overflow-y: auto", source)
         self.assertIn("sessionStorage", source)
         self.assertIn("nearBottom", source)
+        self.assertIn("markUpwardIntent", source)
+        self.assertIn('addEventListener("wheel"', source)
+        self.assertIn('addEventListener("touchmove"', source)
+        self.assertIn('event.key === "PageUp"', source)
+        self.assertIn("__physicsScrollRestoreVersion", source)
+        self.assertIn("forceAwayFromBottom || upwardActive ? false", source)
 
 
 if __name__ == "__main__":

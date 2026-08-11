@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from src.schemas import (
     AgentRunTrace,
+    ContextTraceMetadata,
     RunStatus,
     StepStatus,
     StepTrace,
@@ -152,6 +153,7 @@ class RunTraceBuilder:
         use_tools: bool,
         rag_searches: int,
         tool_executions: int,
+        context_metadata: ContextTraceMetadata | None = None,
     ) -> AgentRunTrace:
         """汇总步骤计数、耗时和路由字段，并封闭当前 Builder。"""
         if self._finished:
@@ -177,6 +179,7 @@ class RunTraceBuilder:
             teaching_mode=teaching_mode,
             use_rag=use_rag,
             use_tools=use_tools,
+            context_metadata=context_metadata,
             steps=list(self._steps),
         )
         self._finished = True

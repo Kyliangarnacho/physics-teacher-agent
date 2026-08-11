@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -12,6 +12,8 @@ from typing import Any
 from openai import OpenAI
 
 from src.config import load_qwen_config
+from src.context.adapters import build_tool_context_view
+from src.context.schemas import ContextBundle
 from src.model_client import build_messages
 from src.observability import ErrorType, StepTimer, create_skipped_step
 from src.retry import run_with_one_retry
@@ -27,6 +29,15 @@ CompletionFunc = Callable[..., Any]
 ShouldRetryFunc = Callable[[Exception], bool]
 MAX_TOOL_CALLS = 5
 TOOL_SELECTION_INSTRUCTION = (
+    "上下文仅用于理解当前用户问题的必要条件。"
+    "历史中已经完成的计算、旧问题、旧工具需求不得视为本轮待执行任务。"
+    "只为当前用户请求选择必要工具。"
+    "不要因为历史上下文中出现多个可计算表达式而重复调用对应工具。"
+    "若当前用户明确要求不计算、只解释，则不要调用计算工具。"
+    "若历史讨论过 A、B、C 而当前只问其中一项，只处理当前明确指定的那一项。"
+    "工具参数只能来自当前请求的明确条件或为当前指代恢复的必要条件；"
+    "若存在多个合理解释或会实质改变题意，不要猜测参数或调用工具。"
+    "学生写出的公式或概念不能仅因来自当前 user 就当作正确先验。"
     "先判断白名单工具是否能直接、可靠地核算用户要求的关键数值。"
     "若条件完整且有匹配工具，应主动调用；即使可以心算，也不要放弃有价值的确定性工具。"
     "若多个彼此独立的计算都被现有工具覆盖，可以一次返回多个 tool_calls。"
@@ -337,8 +348,28 @@ def answer_with_tools(
     teaching_state_context: str | None = None,
     learning_memory_context: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    context_bundle_context: str | None = None,
+    context_bundle: ContextBundle | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute one to five selected tools, then request one final teacher answer."""
+    has_explicit_projection = any(
+        value is not None
+        for value in (
+            context_bundle_context,
+            teaching_state_context,
+            learning_memory_context,
+            conversation_history,
+        )
+    )
+    if context_bundle is not None and not has_explicit_projection:
+        tool_inputs = build_tool_context_view(
+            context_bundle,
+            {"context_relation": "uncertain"},
+        )
+        context_bundle_context = tool_inputs["context_bundle_context"]
+        teaching_state_context = tool_inputs["teaching_state_context"]
+        learning_memory_context = tool_inputs["learning_memory_context"]
+        conversation_history = tool_inputs["conversation_history"]
     kwargs: dict[str, object] = {}
     if teaching_state_context is not None:
         kwargs["teaching_state_context"] = teaching_state_context
@@ -346,6 +377,10 @@ def answer_with_tools(
         kwargs["learning_memory_context"] = learning_memory_context
     if conversation_history is not None:
         kwargs["conversation_history"] = conversation_history
+    if context_bundle_context is not None:
+        kwargs["context_bundle_context"] = context_bundle_context
+    if context_bundle is not None:
+        kwargs["context_bundle"] = context_bundle
     messages: list[dict[str, Any]] = list(
         build_messages(question, context, mode_instruction, **kwargs)
     )

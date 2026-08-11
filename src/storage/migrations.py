@@ -1,6 +1,6 @@
 """SQLite Schema 迁移：使用 ``PRAGMA user_version`` 管理版本并保证原子性。
 
-当前 schema 版本为 3，在既有会话数据上增加后台回答 generation_jobs 表。
+当前 schema 版本为 4，在既有会话数据上增加 conversation_summaries 表。
 Agent 运行额外保存安全的 Analyzer 分析摘要，供历史恢复决策展示。字段名是后续
 Repository 与 Conversation Service 的数据合同，
 不得自行改名或用 JSON 大字段替代明确字段。每个版本在一个显式事务中应用，
@@ -13,7 +13,7 @@ import sqlite3
 from collections.abc import Sequence
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 _SCHEMA_MIGRATIONS: dict[int, Sequence[str]] = {
@@ -150,6 +150,22 @@ _SCHEMA_MIGRATIONS: dict[int, Sequence[str]] = {
         CREATE UNIQUE INDEX uq_generation_jobs_active_conversation
             ON generation_jobs(conversation_id)
             WHERE status IN ('pending', 'running')
+        """,
+    ),
+    4: (
+        """
+        CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY
+                REFERENCES conversations(id)
+                ON DELETE CASCADE,
+            summary_text TEXT NOT NULL,
+            covered_until_message_id TEXT,
+            covered_turn_count INTEGER NOT NULL DEFAULT 0,
+            summary_revision INTEGER NOT NULL DEFAULT 1,
+            model_name TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
         """,
     ),
 }

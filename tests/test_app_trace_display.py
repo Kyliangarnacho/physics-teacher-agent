@@ -138,6 +138,46 @@ class AppTraceDisplayTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         self.assertNotIn("Agent 运行轨迹", self.status_labels(app))
 
+    def test_context_trace_displays_only_safe_statistics(self) -> None:
+        trace = {
+            "run_id": "context-trace",
+            "status": "completed",
+            "total_duration_ms": 1,
+            "total_model_requests": 2,
+            "rag_searches": 0,
+            "tool_executions": 0,
+            "analysis_fallback": False,
+            "steps": [],
+            "context_metadata": {
+                "summary_revision": 2,
+                "summary_present": True,
+                "bridge_turn_count": 1,
+                "recent_turn_count": 3,
+                "retrieved_turn_count": 2,
+                "history_retrieval_used": True,
+                "context_estimated_chars": 900,
+                "budget_limit": 12000,
+                "budget_exceeded": False,
+                "trimmed_components": ["retrieved_history"],
+                "analyzer_context_chars": 800,
+                "tool_context_chars": None,
+                "final_context_chars": 800,
+                "summary_text": "data:image/png;base64,forbidden",
+            },
+        }
+
+        app = self.run_app(self.seed_assistant(trace))
+
+        rendered = self.visible_text(app)
+        self.assertIn("Context metadata", rendered)
+        self.assertIn("Context budget", rendered)
+        self.assertIn("Context projections", rendered)
+        self.assertIn("summary_revision=2", rendered)
+        self.assertIn("bridge/recent/retrieved=1/3/2", rendered)
+        self.assertIn("trimmed=retrieved_history", rendered)
+        self.assertIn("analyzer=800, tool=None, final=800", rendered)
+        self.assertNotIn("data:image", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

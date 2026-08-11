@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import RLock
 from typing import Any
 
 from src.conversation.service import execute_generation_job
+from src.tasks.context_maintenance import ContextMaintenanceTaskManager
 from src.storage import (
     RepositoryError,
+    claim_generation_job,
+    fail_generation_job,
+    get_generation_job,
     list_pending_generation_jobs,
     mark_running_interrupted,
     retry_generation_job,
@@ -17,6 +22,7 @@ from src.storage import (
 
 
 MAX_GENERATION_WORKERS = 2
+logger = logging.getLogger(__name__)
 
 
 class TaskManagerError(Exception):
@@ -31,9 +37,17 @@ class GenerationTaskManager:
         *,
         db_path=None,
         execute_func: Callable[..., dict[str, Any]] | None = None,
+        context_maintenance_manager: ContextMaintenanceTaskManager | None = None,
     ) -> None:
         self._db_path = db_path
         self._execute_func = execute_func or execute_generation_job
+        self._context_maintenance_manager = context_maintenance_manager
+        self._owns_context_maintenance_manager = False
+        if self._context_maintenance_manager is None and execute_func is None:
+            self._context_maintenance_manager = ContextMaintenanceTaskManager(
+                db_path=db_path,
+            )
+            self._owns_context_maintenance_manager = True
         self._executor = ThreadPoolExecutor(
             max_workers=MAX_GENERATION_WORKERS,
             thread_name_prefix="generation-job",
@@ -52,9 +66,70 @@ class GenerationTaskManager:
         return job_id.strip()
 
     def _run_job(self, job_id: str) -> dict[str, Any]:
-        return self._execute_func(job_id, db_path=self._db_path)
+        result = self._execute_func(job_id, db_path=self._db_path)
+        self._schedule_context_maintenance(result)
+        return result
 
-    def _remove_scheduled(self, job_id: str) -> None:
+    def _schedule_context_maintenance(self, result: dict[str, Any]) -> None:
+        """Best-effort handoff after a newly completed Generation Job."""
+
+        manager = self._context_maintenance_manager
+        if manager is None or result.get("skipped"):
+            return
+        job = result.get("generation_job")
+        if not isinstance(job, dict) or job.get("status") != "completed":
+            return
+        conversation_id = result.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            return
+        try:
+            # The maintenance worker performs the persisted stale check.  This
+            # completion handoff stays O(1) and never waits for SQLite history
+            # reads or the Summary API.
+            manager.submit(conversation_id)
+        except Exception:
+            # Summary maintenance is advisory and must never change Generation
+            # success or expose background scheduling details to the caller.
+            return
+
+    def _mark_unhandled_worker_failure(self, job_id: str) -> None:
+        """Best-effort terminalization when a Future escapes service handling."""
+
+        try:
+            job = get_generation_job(job_id, path=self._db_path)
+            if job is None:
+                return
+            if job.get("status") == "pending":
+                # The worker did start, even if an injected/orchestration
+                # callable failed before the normal service claim.
+                claimed = claim_generation_job(job_id, path=self._db_path)
+                job = claimed or get_generation_job(job_id, path=self._db_path)
+            if job is not None and job.get("status") == "running":
+                fail_generation_job(
+                    job_id,
+                    "worker_unhandled_error",
+                    "The background generation worker stopped unexpectedly.",
+                    path=self._db_path,
+                )
+        except Exception as exc:
+            logger.error(
+                "Generation worker failure could not be persisted for job %s (%s).",
+                job_id,
+                type(exc).__name__,
+            )
+
+    def _complete_scheduled(self, job_id: str, future: Future) -> None:
+        try:
+            future.result()
+        except BaseException as exc:
+            # Never log exception text: provider errors can contain request
+            # details.  Persist only a fixed safe failure for UI/retry flow.
+            self._mark_unhandled_worker_failure(job_id)
+            logger.error(
+                "Generation worker stopped unexpectedly for job %s (%s).",
+                job_id,
+                type(exc).__name__,
+            )
         with self._lock:
             self._scheduled.discard(job_id)
             self._futures.pop(job_id, None)
@@ -72,8 +147,9 @@ class GenerationTaskManager:
             raise TaskManagerError("后台任务提交失败。") from exc
         self._futures[job_id] = future
         future.add_done_callback(
-            lambda _future, scheduled_job_id=job_id: self._remove_scheduled(
-                scheduled_job_id
+            lambda completed, scheduled_job_id=job_id: self._complete_scheduled(
+                scheduled_job_id,
+                completed,
             )
         )
         return True
@@ -151,3 +227,5 @@ class GenerationTaskManager:
                 return
             self._shutdown = True
         self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._owns_context_maintenance_manager:
+            self._context_maintenance_manager.shutdown()

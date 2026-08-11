@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.analyzer import analyze_question_with_trace
+from src.context.adapters import (
+    build_final_context_view,
+    build_tool_context_view,
+)
+from src.context.schemas import ContextBundle
 from src.model_client import answer_question, validate_conversation_history
 from src.observability import RunTraceBuilder, StepTimer, create_skipped_step
 from src.prompts import MODE_INSTRUCTIONS
 from src.rag import retrieve_rag_context
 from src.router import route_question
-from src.schemas import ContextRelation, RunStatus, StepStatus, StepTrace
+from src.schemas import (
+    ContextRelation,
+    ContextTraceMetadata,
+    RunStatus,
+    StepStatus,
+    StepTrace,
+)
 from src.tool_client import answer_with_tools
 
 
@@ -34,6 +45,8 @@ def _invoke_with_context(
     teaching_state_context: str | None,
     learning_memory_context: str | None,
     conversation_history: list[dict[str, str]] | None,
+    context_bundle_context: str | None,
+    context_bundle: ContextBundle | None,
 ) -> Any:
     """以兼容方式调用回答/工具函数。
 
@@ -62,6 +75,10 @@ def _invoke_with_context(
         kwargs["learning_memory_context"] = learning_memory_context
     if has_var_keyword or "conversation_history" in supported:
         kwargs["conversation_history"] = conversation_history
+    if has_var_keyword or "context_bundle_context" in supported:
+        kwargs["context_bundle_context"] = context_bundle_context
+    if has_var_keyword or "context_bundle" in supported:
+        kwargs["context_bundle"] = context_bundle
     return func(
         question,
         context=context,
@@ -149,6 +166,34 @@ def _tool_traces_from_result(tool_result: dict[str, Any]) -> list[StepTrace]:
     ]
 
 
+def _context_trace_metadata(
+    bundle: ContextBundle | None,
+    *,
+    analyzer_context_chars: int | None,
+    tool_context_chars: int | None,
+    final_context_chars: int | None,
+) -> ContextTraceMetadata | None:
+    """Project only safe ContextBundle counters into the persisted run trace."""
+
+    if bundle is None or analyzer_context_chars is None:
+        return None
+    return ContextTraceMetadata(
+        summary_revision=bundle.summary_revision,
+        summary_present=bundle.rolling_summary is not None,
+        bridge_turn_count=bundle.bridge_turn_count,
+        recent_turn_count=bundle.recent_turn_count,
+        retrieved_turn_count=bundle.retrieved_turn_count,
+        history_retrieval_used=bundle.retrieved_history.retrieval_used,
+        context_estimated_chars=bundle.estimated_chars,
+        budget_limit=bundle.budget_limit,
+        budget_exceeded=bundle.budget_exceeded,
+        trimmed_components=list(bundle.trimmed_components),
+        analyzer_context_chars=analyzer_context_chars,
+        tool_context_chars=tool_context_chars,
+        final_context_chars=final_context_chars,
+    )
+
+
 def run_teacher_agent(
     question: str,
     mode_override: str = "auto",
@@ -165,6 +210,7 @@ def run_teacher_agent(
     learning_memory_context: str | None = None,
     previous_problem_text: str | None = None,
     previous_image_context: str | None = None,
+    context_bundle: ContextBundle | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """分析、路由并回答一道初中物理问题。
 
@@ -177,6 +223,22 @@ def run_teacher_agent(
         raise ValueError("问题不能为空，请提供一道初中物理问题。")
     if not isinstance(image_context_available, bool):
         raise ValueError("image_context_available 必须是布尔值。")
+    analyzer_teaching_state_context = teaching_state_context
+    normalized_bundle: ContextBundle | None = None
+    context_bundle_context: str | None = None
+    analyzer_context_chars: int | None = None
+    final_projection_chars: int | None = None
+    if context_bundle is not None:
+        bundle_inputs = build_final_context_view(context_bundle)
+        normalized_bundle = bundle_inputs["context_bundle"]
+        context_bundle_context = bundle_inputs["context_bundle_context"]
+        analyzer_context_chars = int(bundle_inputs["context_chars"])
+        final_projection_chars = analyzer_context_chars
+        conversation_history = bundle_inputs["conversation_history"]
+        teaching_state_context = bundle_inputs["teaching_state_context"]
+        learning_memory_context = bundle_inputs["learning_memory_context"]
+        if analyzer_teaching_state_context is None:
+            analyzer_teaching_state_context = teaching_state_context
     validate_conversation_history(conversation_history)
     if teaching_state_context is not None and not isinstance(
         teaching_state_context,
@@ -214,13 +276,26 @@ def run_teacher_agent(
     analysis, analysis_fallback, analyzer_trace = analyze_question_with_trace(
         analysis_question,
         analyze_func=analyzer_func,
-        teaching_state_context=teaching_state_context,
+        teaching_state_context=analyzer_teaching_state_context,
         learning_memory_context=learning_memory_context,
         conversation_history=conversation_history,
+        context_bundle=normalized_bundle,
     )
     trace_builder.add_step(analyzer_trace)
 
     relation = analysis.context_relation
+    tool_context_bundle_context = context_bundle_context
+    tool_conversation_history = conversation_history
+    tool_teaching_state_context = teaching_state_context
+    tool_learning_memory_context = learning_memory_context
+    tool_projection_chars: int | None = None
+    if normalized_bundle is not None:
+        tool_inputs = build_tool_context_view(normalized_bundle, analysis)
+        tool_context_bundle_context = tool_inputs["context_bundle_context"]
+        tool_conversation_history = tool_inputs["conversation_history"]
+        tool_teaching_state_context = tool_inputs["teaching_state_context"]
+        tool_learning_memory_context = tool_inputs["learning_memory_context"]
+        tool_projection_chars = int(tool_inputs["context_chars"])
     can_inherit_previous = relation in {
         ContextRelation.FOLLOW_UP,
         ContextRelation.UNCERTAIN,
@@ -297,6 +372,12 @@ def run_teacher_agent(
             use_tools=route.use_tools,
             rag_searches=0,
             tool_executions=0,
+            context_metadata=_context_trace_metadata(
+                normalized_bundle,
+                analyzer_context_chars=analyzer_context_chars,
+                tool_context_chars=None,
+                final_context_chars=None,
+            ),
         )
         return {
             "answer": route.user_message or "",
@@ -317,6 +398,8 @@ def run_teacher_agent(
     context = None
     sources: list[dict[str, Any]] = []
     rag_searches = 0
+    tool_context_chars: int | None = None
+    final_context_chars: int | None = None
     if route.use_rag:
         retrieval_timer = StepTimer("rag_retrieval")
         retrieval = retrieve_rag_context(
@@ -364,6 +447,7 @@ def run_teacher_agent(
             tool_records = []
             tool_model_requests = 0
             tool_fallback = True
+            final_context_chars = final_projection_chars
             fallback_timer = StepTimer("final_answer")
             answer = _invoke_with_context(
                 active_answer_func,
@@ -373,6 +457,8 @@ def run_teacher_agent(
                 teaching_state_context=teaching_state_context,
                 learning_memory_context=learning_memory_context,
                 conversation_history=conversation_history,
+                context_bundle_context=context_bundle_context,
+                context_bundle=normalized_bundle,
             )
             trace_builder.add_step(
                 fallback_timer.finish(
@@ -391,14 +477,17 @@ def run_teacher_agent(
                 if tool_answer_func is not None
                 else answer_with_tools
             )
+            tool_context_chars = tool_projection_chars
             tool_result = _invoke_with_context(
                 active_tool_answer_func,
                 active_question,
                 context=context,
                 mode_instruction=mode_instruction,
-                teaching_state_context=teaching_state_context,
-                learning_memory_context=learning_memory_context,
-                conversation_history=conversation_history,
+                teaching_state_context=tool_teaching_state_context,
+                learning_memory_context=tool_learning_memory_context,
+                conversation_history=tool_conversation_history,
+                context_bundle_context=tool_context_bundle_context,
+                context_bundle=normalized_bundle,
             )
             answer = tool_result["answer"]
             tool_records = tool_result["tool_records"]
@@ -418,6 +507,7 @@ def run_teacher_agent(
             )
             if effective_image_available and recoverable_tool_error is not None:
                 fallback_timer = StepTimer("final_answer")
+                final_context_chars = final_projection_chars
                 answer = _invoke_with_context(
                     active_answer_func,
                     active_question,
@@ -426,6 +516,8 @@ def run_teacher_agent(
                     teaching_state_context=teaching_state_context,
                     learning_memory_context=learning_memory_context,
                     conversation_history=conversation_history,
+                    context_bundle_context=context_bundle_context,
+                    context_bundle=normalized_bundle,
                 )
                 trace_builder.add_step(
                     fallback_timer.finish(
@@ -441,6 +533,7 @@ def run_teacher_agent(
     else:
         tool_fallback = False
         answer_timer = StepTimer("final_answer")
+        final_context_chars = final_projection_chars
         answer = _invoke_with_context(
             active_answer_func,
             active_question,
@@ -449,6 +542,8 @@ def run_teacher_agent(
             teaching_state_context=teaching_state_context,
             learning_memory_context=learning_memory_context,
             conversation_history=conversation_history,
+            context_bundle_context=context_bundle_context,
+            context_bundle=normalized_bundle,
         )
         tool_records = []
         tool_model_requests = 0
@@ -473,6 +568,12 @@ def run_teacher_agent(
         use_tools=route.use_tools,
         rag_searches=rag_searches,
         tool_executions=len(tool_records),
+        context_metadata=_context_trace_metadata(
+            normalized_bundle,
+            analyzer_context_chars=analyzer_context_chars,
+            tool_context_chars=tool_context_chars,
+            final_context_chars=final_context_chars,
+        ),
     )
 
     return {

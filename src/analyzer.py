@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from openai import OpenAI
 from pydantic import ValidationError
 
 from src.config import load_qwen_config
+from src.context.adapters import build_analyzer_context_view
+from src.context.schemas import ContextBundle
 from src.model_client import build_conversation_messages
 from src.observability import ErrorType, StepTimer
 from src.prompts import QUESTION_ANALYZER_SYSTEM_PROMPT
@@ -48,6 +51,8 @@ def _invoke_analyze_func(
     teaching_state_context: str | None,
     learning_memory_context: str | None,
     conversation_history: list[dict[str, str]] | None,
+    context_bundle_context: str | None,
+    context_bundle: ContextBundle | None,
 ) -> str:
     """以兼容方式调用注入的分析函数。
 
@@ -76,6 +81,10 @@ def _invoke_analyze_func(
         kwargs["learning_memory_context"] = learning_memory_context
     if has_var_keyword or "conversation_history" in supported:
         kwargs["conversation_history"] = conversation_history
+    if has_var_keyword or "context_bundle_context" in supported:
+        kwargs["context_bundle_context"] = context_bundle_context
+    if has_var_keyword or "context_bundle" in supported:
+        kwargs["context_bundle"] = context_bundle
     return analyze_func(question, **kwargs)
 
 
@@ -85,6 +94,8 @@ def _call_analyzer_model(
     teaching_state_context: str | None = None,
     learning_memory_context: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    context_bundle_context: str | None = None,
+    context_bundle: ContextBundle | None = None,
 ) -> str:
     api_key, base_url, model = load_qwen_config()
     client = OpenAI(api_key=api_key, base_url=base_url)
@@ -94,6 +105,8 @@ def _call_analyzer_model(
         teaching_state_context=teaching_state_context,
         learning_memory_context=learning_memory_context,
         conversation_history=conversation_history,
+        context_bundle_context=context_bundle_context,
+        context_bundle=context_bundle,
     )
     response = client.chat.completions.create(
         model=model,
@@ -112,6 +125,7 @@ def analyze_question(
     teaching_state_context: str | None = None,
     learning_memory_context: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    context_bundle: ContextBundle | Mapping[str, Any] | None = None,
 ) -> tuple[QuestionAnalysis, bool]:
     analysis, analysis_fallback, _ = analyze_question_with_trace(
         question,
@@ -119,6 +133,7 @@ def analyze_question(
         teaching_state_context=teaching_state_context,
         learning_memory_context=learning_memory_context,
         conversation_history=conversation_history,
+        context_bundle=context_bundle,
     )
     return analysis, analysis_fallback
 
@@ -131,6 +146,7 @@ def analyze_question_with_trace(
     teaching_state_context: str | None = None,
     learning_memory_context: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    context_bundle: ContextBundle | Mapping[str, Any] | None = None,
 ) -> tuple[QuestionAnalysis, bool, StepTrace]:
     """分析问题，并返回与本次 Analyzer 执行对应的步骤记录。
 
@@ -140,22 +156,39 @@ def analyze_question_with_trace(
         raise ValueError("问题不能为空，请提供一道初中物理问题。")
 
     normalized_question = question.strip()
+    normalized_bundle: ContextBundle | None = None
+    context_bundle_context: str | None = None
+    if context_bundle is not None:
+        bundle_inputs = build_analyzer_context_view(context_bundle)
+        normalized_bundle = bundle_inputs["context_bundle"]
+        context_bundle_context = bundle_inputs["context_bundle_context"]
+        if teaching_state_context is None:
+            teaching_state_context = bundle_inputs["teaching_state_context"]
+        learning_memory_context = bundle_inputs["learning_memory_context"]
+        conversation_history = bundle_inputs["conversation_history"]
     timer = StepTimer("analyzer")
     retry_predicate = should_retry if should_retry is not None else lambda error: True
 
     def call_model() -> str:
-        return _invoke_analyze_func(
-            analyze_func,
-            normalized_question,
-            teaching_state_context=teaching_state_context,
-            learning_memory_context=learning_memory_context,
-            conversation_history=conversation_history,
-        ) if analyze_func is not None else _call_analyzer_model(
-            normalized_question,
-            teaching_state_context=teaching_state_context,
-            learning_memory_context=learning_memory_context,
-            conversation_history=conversation_history,
-        )
+        if analyze_func is not None:
+            return _invoke_analyze_func(
+                analyze_func,
+                normalized_question,
+                teaching_state_context=teaching_state_context,
+                learning_memory_context=learning_memory_context,
+                conversation_history=conversation_history,
+                context_bundle_context=context_bundle_context,
+                context_bundle=normalized_bundle,
+            )
+        kwargs: dict[str, Any] = {
+            "teaching_state_context": teaching_state_context,
+            "learning_memory_context": learning_memory_context,
+            "conversation_history": conversation_history,
+        }
+        if normalized_bundle is not None:
+            kwargs["context_bundle_context"] = context_bundle_context
+            kwargs["context_bundle"] = normalized_bundle
+        return _call_analyzer_model(normalized_question, **kwargs)
 
     outcome = run_with_one_retry(
         call_model,

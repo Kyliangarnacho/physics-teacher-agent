@@ -1,15 +1,15 @@
 # 当前状态
 
-## Stage 11.2 状态
+## Stage 11.3 状态
 
 “初中物理教师 Agent + 阿里云百炼千问 API”当前使用 `qwen3.7-flash`，提示词版本仍为
 `teacher_v3_personal_humor`。Stage 10 在 Stage 09 视觉/多图基础上加入 SQLite 持久会话、
 多会话管理、最近历史与教学状态，以及长期学习记忆的手动提取、确认和召回；Stage 11.1
 进一步加入有限多工具编排、参数 repair、Model-only fallback 和公开工具选择评测。Stage 11.2
-现已加入 SQLite Generation Job、双 Worker 后台生成、启动恢复、人工 Retry 和 Streamlit
-局部状态轮询；页面提交问题后会立即持久化 user 消息，不再同步等待 Agent 完成。当前还支持
-受控本地图片附件持久化、同批多图关系融合、Analyzer 语义判断的跨轮图片上下文继承，以及
-独立单 Worker 的异步学习表现分析。
+加入 SQLite Generation Job、双 Worker 后台生成、恢复/Retry、图片附件与多图上下文。Stage 11.3
+现已加入 Migration V4、Rolling Summary、Unsummarized Bridge、conversation-scoped BM25 历史
+检索、确定性 Context Budget、单轮 ContextBundle 快照、Analyzer/Tool/Final Projection、后台
+Summary maintenance 与只含安全统计的 Context Trace。
 
 当前个人风格以讲解逻辑、条件分类、因果链和纠错方式为核心。幽默仅在语境自然匹配时
 偶尔出现，不要求每题都有。
@@ -39,10 +39,12 @@
 - `src/retry.py`：提供至多重试一次的通用有限 Retry
 - `src/vision/`：图片预处理、视觉/OCR Client、结果合并、安全上下文、多图 Batch 与关系融合
 - `src/ui/paste_images.py`：图片粘贴辅助和哈希去重；原生附件上传仍可独立使用
-- `src/storage/`：SQLite 短连接、Migration V1～V3、Generation Job Schema 与 Repository 数据访问层
+- `src/storage/`：SQLite 短连接、Migration V1～V4、Generation Job、Conversation Summary 与 Repository
 - `src/conversation/`：会话 Schema、最近历史窗口、教学状态解析，以及 enqueue/execute 分离的
   Conversation Service；旧同步入口继续保留
-- `src/tasks/`：固定两个 Worker 的 GenerationTaskManager，及独立单 Worker 的学习表现分析任务管理器
+- `src/context/`：Summary/Bridge/Recent、旧历史 BM25、Context Budget、ContextBundle 与三类 Projection
+- `src/tasks/`：固定两个 Worker 的 GenerationTaskManager，以及独立单 Worker 的学习表现分析和
+  Context Maintenance 管理器
 - `src/memory/`：长期记忆候选提取、确认、检索、模型注入与异步学习表现分析
 - `scripts/probe_stage09_vision.py`：视觉模型结构化提取能力的人工诊断探针
 - `scripts/probe_stage10_conversation_context.py` / `probe_stage10_conversation_service.py`：
@@ -70,6 +72,36 @@
 API Key 仅保存在本地 `.env` 中；`.env` 和 `.venv` 均被 Git 忽略。
 原始资料和私有风格示例分别保存在 `data/raw/` 与 `data/private_evaluation/`，两个目录
 均被 Git 忽略且不会提交。
+
+## Stage 11.3 上下文数据流
+
+```text
+Messages
+→ Rolling Summary / Unsummarized Bridge / Recent 3 turns
+→ conversation-scoped History Retrieval
+→ Context Manager + deterministic character Budget
+→ one ContextBundle snapshot per Generation
+→ Analyzer / Tool / Final Projection
+→ Agent
+```
+
+Summary 是有损压缩，Bridge 保存已经离开 Recent 但尚未被 Summary boundary 覆盖的完整原文轮次，
+因此 `Summary + Bridge + Recent` 始终连续。Retrieved 只从 Summary-covered 的更老轮次中召回，排除
+Bridge 和 Recent；旧 assistant 仅代表过去谈过什么，不是可靠物理知识。当前用户问题始终是本轮
+唯一任务，历史只用于消歧、条件恢复、指代理解和连续性。
+
+```text
+Generation completed
+→ O(1) Context maintenance submit
+→ single ContextMaintenance Worker
+→ persisted stale check
+→ Rolling Summary refresh
+```
+
+Summary maintenance 不进入 Generation critical path，不建立 summary_jobs。失败时旧 Summary、covered
+boundary 和 Bridge 均保持不变，下次 stale 时可以再次调度。
+
+阶段实现与调试边界见 `docs/STAGE11_3_CONTEXT_ENGINEERING.md`。
 
 ## 图片数据流
 
@@ -174,10 +206,11 @@ SQLite 是持久消息的 Source of Truth，`st.session_state` 只保存当前�
 缓存和未发送图片、待确认图片、输入控件等页面临时状态。支持多会话新建、切换、重命名、
 清空（保留会话）与删除；浏览器新会话或服务重启后，历史从 SQLite 恢复。
 
-页面使用 `list_messages` 恢复历史并用 `display_content` 渲染；assistant 的 sources、
-route、tool_records、trace 从对应 agent_run 的 JSON 字段还原。最近 3 个完整轮次
-（6000 字符）与教学状态（含连续 hint）会注入 Analyzer、普通回答、RAG 和 Tool 链路；
-当前问题始终是最后一条 user 消息。
+页面使用 `list_messages` 恢复历史并用 `display_content` 渲染；assistant 的 sources、route、
+tool_records、trace 从对应 agent_run 的 JSON 字段还原。每个 Generation 只构造一次 ContextBundle，
+以 12000 字符的项目内部安全预算组合 Summary、Bridge、Recent、Retrieved、ConversationState 与
+Learning Memory，再为 Analyzer、Tool 和 Final 生成确定性 Projection；当前问题始终是最后一条
+user 消息和本轮唯一执行目标。
 
 后台回答状态为 `pending → running → completed/failed`；服务启动时遗留 `running` 会标记为
 `interrupted`，`pending` 会自动重新调度。`failed/interrupted` 只能人工 Retry，且复用原 Job 与
@@ -190,12 +223,20 @@ Generation Job 只保存回答所需文本参数和已确认图片上下文。�
 Worker 不访问 `st.*` 或 `session_state`，每次 Repository 操作独立打开 SQLite 短连接；进程内
 `scheduled` 集合与数据库原子 claim 共同防止重复执行。
 
+Generation Future 的未处理异常会将仍为 pending/running 的 Job 安全落成 failed；进程重启时遗留
+running 仍转为 interrupted。两种终态都可复用原 Job 与原 user message 人工 Retry。completed 后只
+向 Context Maintenance Worker 轻量 submit，stale scan 和 Summary API 均不占用 Generation Worker。
+
 ## 长期记忆流程
 
 - 成功回答下方可点击“分析本轮学习表现”手动提取候选（不自动提取）；提取在独立后台线程执行，
   不占用 Generation Job 的两个 Worker，也不会阻塞继续提问或切换会话；
 - 候选暂存 `session_state`（按会话与消息隔离），确认保存后才写入 learning_memories；
 - 只有 `confirmed=1` 且 `active=1` 的记忆会被召回并注入相关题目；
+- 普通单次错误不自动认定为 weakness；misconception 需要明确错误规律，preference 需要用户明确表达；
+- Context Manager 只检索并格式化现有 Memory，失败时安全降级为空；Tool Projection 不携带 Memory；
+- Conversation Summary 记录本会话事实连续性，Learning Memory 记录用户确认的跨会话稳定学习信息，
+  两者不会互相写入或替代；
 - “学习档案”展示已确认记忆，支持停用和删除；
 - 提取/确认失败显示安全错误，不泄露密钥、SQL 或路径。
 
@@ -217,7 +258,7 @@ Worker 不访问 `st.*` 或 `session_state`，每次 Repository 操作独立打�
 - BM25 默认 `top_k=3`、`min_score_ratio=0.3`
 - 检索器固定查询能够命中对应电路、凸透镜和电热器卡片
 - context 注入、无来源回退、sources 顺序和精简字段均有 mock/fake 测试
-- 当前共有 680 项单元测试，全部通过
+- 当前共有 794 项单元测试，全部通过
 - Stage 05 已完成普通网页问答和真实千问调用，并真实验证电热器、凸透镜 RAG 问答
 - 加入相对分数过滤后再次验证电热器问题，网页来源只返回 `KB-POWER-001`
 - 页面与终端验证过程中没有出现应用 traceback
@@ -255,6 +296,9 @@ Worker 不访问 `st.*` 或 `session_state`，每次 Repository 操作独立打�
   recall 80.0%、no-tool 正确率 83.3%、多工具完整命中率 100%，保留 1 次误调用作为限制
 - Stage 11.2 Generation Job、Migration V3、enqueue/execute、双 Worker Task Manager、recover、
   Retry、Streamlit 状态展示、局部 Polling、多会话隔离及活动会话保护均有 Fake/Mock 测试覆盖
+- Stage 11.3 Migration V4、Rolling Summary、Bridge/Recent 连续覆盖、History Retrieval、Context
+  Budget、单次 Bundle 构建、三类 Projection、Current Query 优先级、后台 maintenance、Future
+  终态保护、Context Trace、A/B 隔离与图片 follow-up 均有 Fake/Mock 集成测试覆盖
 
 用户已手动验证：
 
@@ -265,7 +309,7 @@ Worker 不访问 `st.*` 或 `session_state`，每次 Repository 操作独立打�
 ## 当前限制
 
 10 条知识卡片只覆盖欧姆定律与动态电路、电功率、光学、实验与易错点，不能代表完整初中
-物理。BM25 仍依赖词面匹配；相对分数阈值只能减少低相关噪声，不能保证语义相关性或资料
+物理。BM25 仍依赖词面匹配；有效词重合与绝对/相对分数门槛只能减少低相关噪声，不能保证语义相关性或资料
 正确性。当前没有向量检索、重排序、系统化召回评测或自动事实校验；真实网页验收目前只
 覆盖普通问答、电热器和凸透镜等少量问题，不能代表完整 RAG 效果。
 
@@ -289,7 +333,8 @@ Stage 08 的 8 道题是工程路径小样本，未对全部回答进行系统�
 
 后台任务仍是单进程 `ThreadPoolExecutor` 实现，最多两个 Worker，不是分布式队列；进程退出时
 遗留 running 会在下次启动变为 interrupted，需要人工 Retry。Vision/OCR 和人工确认仍在页面
-线程同步完成，Stage 11.2 只后台化确认后的教师回答生成。
+线程同步完成；教师回答与 Summary maintenance 分别使用独立后台 Worker。
 
-近期历史窗口仍固定为最多 3 个完整轮次、6000 字符；页面显示的完整历史不等于模型长期上下文，
-长期上下文管理留待后续阶段处理。
+Context Budget 是项目内部 12000 字符安全预算，不等于 Qwen 官方最大上下文窗口；Summary 与
+BM25 History Retrieval 都是有损/词面方法，不能替代原始 SQLite 消息或可靠物理知识。当前没有
+Embedding、Reranker、Vector DB、跨 conversation 历史搜索或 Summary 持久任务恢复表。

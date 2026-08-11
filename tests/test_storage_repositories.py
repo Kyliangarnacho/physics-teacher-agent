@@ -17,10 +17,12 @@ from src.storage import (
     create_conversation,
     deactivate_memory,
     delete_conversation,
+    delete_conversation_summary,
     delete_memory,
     finalize_conversation_turn,
     get_agent_runs,
     get_conversation,
+    get_conversation_summary,
     get_conversation_state,
     get_recent_messages,
     initialize_database,
@@ -33,6 +35,7 @@ from src.storage import (
     rename_conversation,
     reset_conversation_state,
     upsert_conversation_state,
+    upsert_conversation_summary,
 )
 from src.storage import repositories
 
@@ -435,6 +438,116 @@ class ConversationStateRepositoryTests(RepositoryTestCase):
         )
 
 
+class ConversationSummaryRepositoryTests(RepositoryTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.conversation = create_conversation("摘要测试", path=self.db_path)
+
+    def test_get_missing_summary_returns_none(self) -> None:
+        self.assertIsNone(
+            get_conversation_summary(
+                self.conversation["id"],
+                path=self.db_path,
+            )
+        )
+
+    def test_upsert_increments_revision_and_updates_boundary(self) -> None:
+        first_time = "2026-08-10T08:00:00+00:00"
+        second_time = "2026-08-10T08:05:00+00:00"
+        with mock.patch(
+            "src.storage.repositories._utc_now_iso",
+            side_effect=[first_time, second_time],
+        ):
+            first = upsert_conversation_summary(
+                self.conversation["id"],
+                "第一版摘要",
+                covered_until_message_id="msg-2",
+                covered_turn_count=1,
+                model_name="qwen-summary-v1",
+                path=self.db_path,
+            )
+            second = upsert_conversation_summary(
+                self.conversation["id"],
+                "第二版摘要",
+                covered_until_message_id="msg-4",
+                covered_turn_count=2,
+                model_name="qwen-summary-v2",
+                path=self.db_path,
+            )
+
+        self.assertEqual(first["summary_revision"], 1)
+        self.assertEqual(first["created_at"], first_time)
+        self.assertEqual(first["updated_at"], first_time)
+        self.assertEqual(second["summary_revision"], 2)
+        self.assertEqual(second["created_at"], first_time)
+        self.assertEqual(second["updated_at"], second_time)
+        self.assertEqual(second["summary_text"], "第二版摘要")
+        self.assertEqual(second["covered_until_message_id"], "msg-4")
+        self.assertEqual(second["covered_turn_count"], 2)
+        self.assertEqual(second["model_name"], "qwen-summary-v2")
+        self.assertEqual(
+            get_conversation_summary(
+                self.conversation["id"],
+                path=self.db_path,
+            ),
+            second,
+        )
+
+    def test_delete_summary(self) -> None:
+        upsert_conversation_summary(
+            self.conversation["id"],
+            "待删除摘要",
+            path=self.db_path,
+        )
+
+        self.assertTrue(
+            delete_conversation_summary(
+                self.conversation["id"],
+                path=self.db_path,
+            )
+        )
+        self.assertIsNone(
+            get_conversation_summary(
+                self.conversation["id"],
+                path=self.db_path,
+            )
+        )
+        self.assertFalse(
+            delete_conversation_summary(
+                self.conversation["id"],
+                path=self.db_path,
+            )
+        )
+
+    def test_summaries_are_isolated_by_conversation(self) -> None:
+        other = create_conversation("其他摘要", path=self.db_path)
+        upsert_conversation_summary(
+            self.conversation["id"],
+            "A 会话摘要",
+            path=self.db_path,
+        )
+        upsert_conversation_summary(
+            other["id"],
+            "B 会话摘要",
+            path=self.db_path,
+        )
+        upsert_conversation_summary(
+            self.conversation["id"],
+            "A 会话第二版摘要",
+            path=self.db_path,
+        )
+
+        summary_a = get_conversation_summary(
+            self.conversation["id"],
+            path=self.db_path,
+        )
+        summary_b = get_conversation_summary(other["id"], path=self.db_path)
+        self.assertEqual(summary_a["summary_text"], "A 会话第二版摘要")
+        self.assertEqual(summary_a["summary_revision"], 2)
+        self.assertEqual(summary_b["summary_text"], "B 会话摘要")
+        self.assertEqual(summary_b["summary_revision"], 1)
+
+
 class MemoryRepositoryTests(RepositoryTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -615,6 +728,13 @@ class CascadeAndTransactionTests(RepositoryTestCase):
             {"conversation_id": conversation["id"], "hint_step": 1},
             path=self.db_path,
         )
+        upsert_conversation_summary(
+            conversation["id"],
+            "删除前摘要",
+            covered_until_message_id=user_message["id"],
+            covered_turn_count=1,
+            path=self.db_path,
+        )
         memory = insert_or_merge_memory(
             {
                 "memory_type": "mistake",
@@ -639,6 +759,9 @@ class CascadeAndTransactionTests(RepositoryTestCase):
         )
         self.assertIsNone(
             get_conversation_state(conversation["id"], path=self.db_path)
+        )
+        self.assertIsNone(
+            get_conversation_summary(conversation["id"], path=self.db_path)
         )
 
         remaining = list_memories(path=self.db_path)
@@ -865,6 +988,28 @@ class ClearConversationContentsTests(RepositoryTestCase):
             {"conversation_id": conversation["id"], "hint_step": 2},
             path=self.db_path,
         )
+        upsert_conversation_summary(
+            conversation["id"],
+            "待清空摘要",
+            covered_turn_count=1,
+            path=self.db_path,
+        )
+        other_summary = upsert_conversation_summary(
+            other["id"],
+            "其他会话摘要",
+            path=self.db_path,
+        )
+        memory = insert_or_merge_memory(
+            {
+                "memory_type": "mistake",
+                "topic": "欧姆定律",
+                "content": "长期记忆不能随清空删除",
+                "normalized_content": "清空后保留长期记忆",
+                "confidence": 0.9,
+                "source_conversation_id": conversation["id"],
+            },
+            path=self.db_path,
+        )
 
         self.assertTrue(
             clear_conversation_contents(conversation["id"], path=self.db_path)
@@ -881,8 +1026,18 @@ class ClearConversationContentsTests(RepositoryTestCase):
         self.assertIsNone(
             get_conversation_state(conversation["id"], path=self.db_path)
         )
+        self.assertIsNone(
+            get_conversation_summary(conversation["id"], path=self.db_path)
+        )
         self.assertIsNotNone(get_conversation(conversation["id"], path=self.db_path))
         self.assertEqual(len(list_messages(other["id"], path=self.db_path)), 1)
+        self.assertEqual(
+            get_conversation_summary(other["id"], path=self.db_path),
+            other_summary,
+        )
+        remaining_memories = list_memories(path=self.db_path)
+        self.assertEqual(len(remaining_memories), 1)
+        self.assertEqual(remaining_memories[0]["id"], memory["id"])
 
     def test_clear_missing_conversation_returns_false(self) -> None:
         self.assertFalse(

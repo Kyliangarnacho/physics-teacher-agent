@@ -35,6 +35,12 @@ STOPWORDS = {
 }
 
 
+# Fixture calibration: clear knowledge-card matches score from 6.90 upward,
+# while generic/noise overlap reaches at most 1.503. This is a local BM25
+# relevance floor, not an LLM confidence score.
+MIN_ABSOLUTE_RETRIEVAL_SCORE = 1.7
+
+
 def tokenize(text: str) -> list[str]:
     """使用 jieba 分词，并移除空白、标点和少量通用停用词。"""
     tokens: list[str] = []
@@ -101,7 +107,7 @@ class KnowledgeRetriever:
         top_k: int = 3,
         min_score_ratio: float = 0.3,
     ) -> list[dict[str, Any]]:
-        """返回达到最高分相对阈值的 BM25 知识卡片。"""
+        """Return BM25 cards passing absolute then relative relevance checks."""
         if not isinstance(question, str) or not question.strip():
             raise ValueError("检索问题不能为空。")
         if type(top_k) is not int or top_k <= 0:
@@ -131,6 +137,8 @@ class KnowledgeRetriever:
             return []
 
         highest_score = positive_ranked[0][1]
+        if highest_score < MIN_ABSOLUTE_RETRIEVAL_SCORE:
+            return []
         minimum_score = highest_score * min_score_ratio
         filtered_ranked = [
             item for item in positive_ranked if item[1] >= minimum_score

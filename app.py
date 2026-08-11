@@ -349,7 +349,7 @@ def get_memory_analysis_task_manager() -> MemoryAnalysisTaskManager:
 
 
 def install_scroll_position_guard(conversation_id: str | None) -> None:
-    """仅在整页 rerun 时恢复历史浏览位置；底部用户仍自然跟随新回答。"""
+    """整页 rerun 时恢复历史位置，同时尊重用户立即向上滚动的意图。"""
     safe_id = "draft" if not conversation_id else "".join(
         char for char in conversation_id if char.isalnum() or char in "-_"
     )
@@ -364,22 +364,93 @@ def install_scroll_position_guard(conversation_id: str | None) -> None:
   if (scroller.__physicsScrollHandler) {{
     scroller.removeEventListener("scroll", scroller.__physicsScrollHandler);
   }}
+  if (scroller.__physicsWheelHandler) {{
+    scroller.removeEventListener("wheel", scroller.__physicsWheelHandler);
+  }}
+  if (scroller.__physicsTouchStartHandler) {{
+    scroller.removeEventListener("touchstart", scroller.__physicsTouchStartHandler);
+  }}
+  if (scroller.__physicsTouchMoveHandler) {{
+    scroller.removeEventListener("touchmove", scroller.__physicsTouchMoveHandler);
+  }}
+  if (scroller.__physicsKeyHandler) {{
+    document.removeEventListener("keydown", scroller.__physicsKeyHandler);
+  }}
   scroller.dataset.physicsScrollGuard = storageKey;
   const saved = JSON.parse(sessionStorage.getItem(storageKey) || "null");
-  if (saved && saved.nearBottom === false) {{
-    requestAnimationFrame(() => requestAnimationFrame(() => {{
-      scroller.scrollTop = saved.top;
-    }}));
-  }}
-  const remember = () => {{
+  const intentWindowMs = 1200;
+  scroller.__physicsUpwardIntentUntil = Math.max(
+    Number(scroller.__physicsUpwardIntentUntil || 0),
+    Number(saved?.upwardIntentUntil || 0)
+  );
+  const restoreVersion = Number(scroller.__physicsScrollRestoreVersion || 0) + 1;
+  scroller.__physicsScrollRestoreVersion = restoreVersion;
+
+  const storePosition = (forceAwayFromBottom = false) => {{
     const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    const upwardActive = Date.now() < scroller.__physicsUpwardIntentUntil;
     sessionStorage.setItem(storageKey, JSON.stringify({{
       top: scroller.scrollTop,
-      nearBottom: distance < 120
+      nearBottom: forceAwayFromBottom || upwardActive ? false : distance < 120,
+      upwardIntentUntil: scroller.__physicsUpwardIntentUntil
     }}));
   }};
+  const markUpwardIntent = () => {{
+    scroller.__physicsUpwardIntentUntil = Date.now() + intentWindowMs;
+    scroller.__physicsScrollRestoreVersion += 1;
+    storePosition(true);
+  }};
+
+  if (
+    saved
+    && saved.nearBottom === false
+    && Date.now() >= scroller.__physicsUpwardIntentUntil
+  ) {{
+    requestAnimationFrame(() => requestAnimationFrame(() => {{
+      if (
+        scroller.__physicsScrollRestoreVersion !== restoreVersion
+        || scroller.dataset.physicsScrollGuard !== storageKey
+        || Date.now() < scroller.__physicsUpwardIntentUntil
+      ) return;
+      scroller.scrollTop = Math.min(
+        Number(saved.top || 0),
+        Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+      );
+    }}));
+  }}
+  const remember = () => storePosition(false);
+  const onWheel = (event) => {{
+    if (event.deltaY < 0) markUpwardIntent();
+  }};
+  let lastTouchY = null;
+  const onTouchStart = (event) => {{
+    lastTouchY = event.touches[0]?.clientY ?? null;
+  }};
+  const onTouchMove = (event) => {{
+    const currentY = event.touches[0]?.clientY ?? null;
+    if (currentY !== null && lastTouchY !== null && currentY > lastTouchY + 2) {{
+      markUpwardIntent();
+    }}
+    lastTouchY = currentY;
+  }};
+  const onKeyDown = (event) => {{
+    if (
+      event.key === "ArrowUp"
+      || event.key === "PageUp"
+      || event.key === "Home"
+      || (event.key === " " && event.shiftKey)
+    ) markUpwardIntent();
+  }};
   scroller.__physicsScrollHandler = remember;
+  scroller.__physicsWheelHandler = onWheel;
+  scroller.__physicsTouchStartHandler = onTouchStart;
+  scroller.__physicsTouchMoveHandler = onTouchMove;
+  scroller.__physicsKeyHandler = onKeyDown;
   scroller.addEventListener("scroll", remember, {{passive: true}});
+  scroller.addEventListener("wheel", onWheel, {{passive: true}});
+  scroller.addEventListener("touchstart", onTouchStart, {{passive: true}});
+  scroller.addEventListener("touchmove", onTouchMove, {{passive: true}});
+  document.addEventListener("keydown", onKeyDown);
   remember();
 }})();
 </script>
@@ -1027,6 +1098,85 @@ def render_tool_records(message: dict[str, object]) -> None:
                 st.markdown("**error：** 无")
 
 
+_SAFE_CONTEXT_TRIMMED_COMPONENTS = {
+    "retrieved_history",
+    "learning_memory_context",
+    "rolling_summary",
+    "unsafe_history",
+}
+
+
+def _safe_context_trace_int(value: object, *, minimum: int = 0) -> int | None:
+    if type(value) is int and value >= minimum:
+        return value
+    return None
+
+
+def _render_context_trace_metadata(metadata: dict[str, object]) -> None:
+    """Render only the fixed, content-free Context Trace statistics."""
+
+    summary_revision = metadata.get("summary_revision")
+    if summary_revision is not None:
+        summary_revision = _safe_context_trace_int(summary_revision, minimum=1)
+    required_ints = {
+        name: _safe_context_trace_int(metadata.get(name))
+        for name in (
+            "bridge_turn_count",
+            "recent_turn_count",
+            "retrieved_turn_count",
+            "context_estimated_chars",
+            "budget_limit",
+            "analyzer_context_chars",
+        )
+    }
+    if (
+        (summary_revision is None and metadata.get("summary_revision") is not None)
+        or any(value is None for value in required_ints.values())
+        or type(metadata.get("summary_present")) is not bool
+        or type(metadata.get("history_retrieval_used")) is not bool
+        or type(metadata.get("budget_exceeded")) is not bool
+    ):
+        return
+    optional_ints: dict[str, int | None] = {}
+    for name in ("tool_context_chars", "final_context_chars"):
+        value = metadata.get(name)
+        optional_ints[name] = (
+            None if value is None else _safe_context_trace_int(value)
+        )
+        if value is not None and optional_ints[name] is None:
+            return
+    trimmed = metadata.get("trimmed_components")
+    if (
+        not isinstance(trimmed, list)
+        or any(item not in _SAFE_CONTEXT_TRIMMED_COMPONENTS for item in trimmed)
+    ):
+        return
+
+    st.markdown(
+        "**Context metadata**  \n"
+        f"summary_present={metadata['summary_present']}, "
+        f"summary_revision={summary_revision}, "
+        f"bridge/recent/retrieved="
+        f"{required_ints['bridge_turn_count']}/"
+        f"{required_ints['recent_turn_count']}/"
+        f"{required_ints['retrieved_turn_count']}, "
+        f"history_retrieval_used={metadata['history_retrieval_used']}"
+    )
+    st.markdown(
+        "**Context budget**  \n"
+        f"estimated={required_ints['context_estimated_chars']}, "
+        f"limit={required_ints['budget_limit']}, "
+        f"exceeded={metadata['budget_exceeded']}, "
+        f"trimmed={','.join(trimmed) or 'none'}"
+    )
+    st.markdown(
+        "**Context projections**  \n"
+        f"analyzer={required_ints['analyzer_context_chars']}, "
+        f"tool={optional_ints['tool_context_chars']}, "
+        f"final={optional_ints['final_context_chars']}"
+    )
+
+
 def render_run_trace(message: dict[str, object]) -> None:
     """展示一次 Agent 运行的安全摘要与步骤级观测字段。"""
     trace = message.get("trace")
@@ -1047,6 +1197,10 @@ def render_run_trace(message: dict[str, object]) -> None:
             f"**tool_executions：** `{trace.get('tool_executions', 0)}`  \n"
             f"**analysis_fallback：** `{trace.get('analysis_fallback', False)}`"
         )
+
+        context_metadata = trace.get("context_metadata")
+        if isinstance(context_metadata, dict):
+            _render_context_trace_metadata(context_metadata)
 
         steps = trace.get("steps", [])
         if not isinstance(steps, list):

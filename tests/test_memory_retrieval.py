@@ -470,7 +470,7 @@ class ServiceRetrievalDegradeTests(unittest.TestCase):
             }
 
         with mock.patch(
-            "src.conversation.service.retrieve_relevant_memories",
+            "src.context.manager.retrieve_relevant_memories",
             side_effect=RuntimeError("检索失败"),
         ):
             result = run_conversation_turn(

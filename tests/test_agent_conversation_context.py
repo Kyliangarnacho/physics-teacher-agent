@@ -144,7 +144,8 @@ class MessageBuilderContextTests(unittest.TestCase):
             [message["role"] for message in messages],
             ["system", "system", "system", "system", "user", "assistant", "user"],
         )
-        self.assertEqual(messages[0]["content"], "基础系统提示")
+        self.assertTrue(messages[0]["content"].startswith("基础系统提示"))
+        self.assertIn("最后一个 user 消息是本轮唯一", messages[0]["content"])
         self.assertEqual(messages[1]["content"], "模式指令")
         self.assertIn("RAG 参考资料", messages[2]["content"])
         self.assertIn("教学状态", messages[3]["content"])

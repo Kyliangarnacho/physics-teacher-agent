@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +29,7 @@ EXPECTED_TABLES = {
     "conversation_states",
     "learning_memories",
     "generation_jobs",
+    "conversation_summaries",
 }
 
 # PRAGMA table_info 每列返回 (type, notnull, dflt_value, pk) 的精确数据合同。
@@ -107,6 +109,31 @@ EXPECTED_COLUMNS = {
         "started_at": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
         "finished_at": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
     },
+    "conversation_summaries": {
+        "conversation_id": {"type": "TEXT", "notnull": 0, "default": None, "pk": 1},
+        "summary_text": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "covered_until_message_id": {
+            "type": "TEXT",
+            "notnull": 0,
+            "default": None,
+            "pk": 0,
+        },
+        "covered_turn_count": {
+            "type": "INTEGER",
+            "notnull": 1,
+            "default": "0",
+            "pk": 0,
+        },
+        "summary_revision": {
+            "type": "INTEGER",
+            "notnull": 1,
+            "default": "1",
+            "pk": 0,
+        },
+        "model_name": {"type": "TEXT", "notnull": 0, "default": None, "pk": 0},
+        "created_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+        "updated_at": {"type": "TEXT", "notnull": 1, "default": None, "pk": 0},
+    },
 }
 
 # PRAGMA foreign_key_list 每行返回 (from, table, to, on_delete) 的精确数据合同。
@@ -120,6 +147,15 @@ EXPECTED_FOREIGN_KEYS = {
         ("conversation_id", "conversations", "id", "CASCADE"),
         ("user_message_id", "messages", "id", "CASCADE"),
     },
+    "conversation_summaries": {
+        ("conversation_id", "conversations", "id", "CASCADE"),
+    },
+}
+
+LEGACY_MIGRATION_FINGERPRINTS = {
+    1: "63277f7aea718f155556ad0de6049aa379963c7f05a0fb3e8ce5998ce48fb82d",
+    2: "7bc91603e36c588b4e14e14e3bd06173c1dd9bd42542437963ba1c147323cff0",
+    3: "14f9078d3adced7b465781174bc101dcccfaa9d1d8e1720d5ef33f14af29c428",
 }
 
 API_CONFIG_KEYS = (
@@ -290,14 +326,14 @@ class DatabaseMigrationTests(unittest.TestCase):
         returned_path = initialize_database(self.db_path)
 
         self.assertEqual(returned_path, self.db_path)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 3)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 4)
         conn = connect_database(self.db_path)
         try:
-            self.assertEqual(migrations.get_user_version(conn), 3)
+            self.assertEqual(migrations.get_user_version(conn), 4)
         finally:
             conn.close()
 
-    def test_initialization_creates_six_tables(self) -> None:
+    def test_initialization_creates_seven_tables(self) -> None:
         initialize_database(self.db_path)
 
         conn = connect_database(self.db_path)
@@ -380,6 +416,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "VALUES (?, ?)",
                 ("conv-1", ISO_TIME),
             )
+            conn.execute(
+                "INSERT INTO conversation_summaries "
+                "(conversation_id, summary_text, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("conv-1", "旧对话摘要", ISO_TIME, ISO_TIME),
+            )
             conn.commit()
 
             conn.execute("DELETE FROM conversations WHERE id = ?", ("conv-1",))
@@ -395,6 +437,12 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(
                 conn.execute(
                     "SELECT COUNT(*) FROM conversation_states"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM conversation_summaries"
                 ).fetchone()[0],
                 0,
             )
@@ -431,6 +479,12 @@ class DatabaseMigrationTests(unittest.TestCase):
                     ISO_TIME,
                 ),
             )
+            conn.execute(
+                "INSERT INTO conversation_summaries "
+                "(conversation_id, summary_text, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("conv-1", "摘要", ISO_TIME, ISO_TIME),
+            )
 
             conversation = conn.execute(
                 "SELECT archived FROM conversations WHERE id = ?",
@@ -445,14 +499,31 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "FROM learning_memories WHERE id = ?",
                 ("mem-1",),
             ).fetchone()
+            summary = conn.execute(
+                "SELECT covered_turn_count, summary_revision "
+                "FROM conversation_summaries WHERE conversation_id = ?",
+                ("conv-1",),
+            ).fetchone()
 
             self.assertEqual(conversation["archived"], 0)
             self.assertEqual(state["hint_step"], 0)
             self.assertEqual(memory["evidence_count"], 1)
             self.assertEqual(memory["confirmed"], 1)
             self.assertEqual(memory["active"], 1)
+            self.assertEqual(summary["covered_turn_count"], 0)
+            self.assertEqual(summary["summary_revision"], 1)
         finally:
             conn.close()
+
+    def test_v1_v2_v3_migration_sql_is_unchanged(self) -> None:
+        actual = {
+            version: sha256(
+                "\0".join(migrations._SCHEMA_MIGRATIONS[version]).encode("utf-8")
+            ).hexdigest()
+            for version in (1, 2, 3)
+        }
+
+        self.assertEqual(actual, LEGACY_MIGRATION_FINGERPRINTS)
 
     def test_learning_memories_unique_dedup_index(self) -> None:
         initialize_database(self.db_path)
@@ -539,7 +610,7 @@ class DatabaseMigrationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_v1_existing_data_survives_v2_and_v3_upgrade(self) -> None:
+    def test_v1_existing_data_survives_v2_v3_and_v4_upgrade(self) -> None:
         conn = connect_database(self.db_path)
         try:
             migrations.apply_migration(conn, 1, migrations._SCHEMA_MIGRATIONS[1])
@@ -556,7 +627,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             )
             conn.commit()
 
-            self.assertEqual(migrations.migrate_database(conn), 3)
+            self.assertEqual(migrations.migrate_database(conn), 4)
             self.assertEqual(
                 conn.execute(
                     "SELECT title FROM conversations WHERE id = 'conv-old'"
@@ -586,8 +657,61 @@ class DatabaseMigrationTests(unittest.TestCase):
 
             self.assertEqual(migrations.get_user_version(conn), 2)
             self.assertNotIn("generation_jobs", table_names(conn))
-            self.assertEqual(migrations.migrate_database(conn), 3)
+            self.assertEqual(migrations.migrate_database(conn), 4)
             self.assertIn("generation_jobs", table_names(conn))
+            self.assertIn("conversation_summaries", table_names(conn))
+        finally:
+            conn.close()
+
+    def test_v3_existing_data_survives_v4_upgrade(self) -> None:
+        conn = connect_database(self.db_path)
+        try:
+            for version in (1, 2, 3):
+                migrations.apply_migration(
+                    conn,
+                    version,
+                    migrations._SCHEMA_MIGRATIONS[version],
+                )
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("conv-v3", "V3 会话", ISO_TIME, ISO_TIME),
+            )
+            conn.commit()
+
+            self.assertEqual(migrations.get_user_version(conn), 3)
+            self.assertNotIn("conversation_summaries", table_names(conn))
+            self.assertEqual(migrations.migrate_database(conn), 4)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT title FROM conversations WHERE id = 'conv-v3'"
+                ).fetchone()[0],
+                "V3 会话",
+            )
+            self.assertIn("conversation_summaries", table_names(conn))
+        finally:
+            conn.close()
+
+    def test_failed_v4_migration_rolls_back_summary_table(self) -> None:
+        conn = connect_database(self.db_path)
+        try:
+            for version in (1, 2, 3):
+                migrations.apply_migration(
+                    conn,
+                    version,
+                    migrations._SCHEMA_MIGRATIONS[version],
+                )
+            with self.assertRaises(sqlite3.OperationalError):
+                migrations.apply_migration(
+                    conn,
+                    4,
+                    (*migrations._SCHEMA_MIGRATIONS[4], "THIS IS NOT VALID SQL"),
+                )
+
+            self.assertEqual(migrations.get_user_version(conn), 3)
+            self.assertNotIn("conversation_summaries", table_names(conn))
+            self.assertEqual(migrations.migrate_database(conn), 4)
+            self.assertIn("conversation_summaries", table_names(conn))
         finally:
             conn.close()
 
@@ -597,7 +721,7 @@ class DatabaseMigrationTests(unittest.TestCase):
 
         conn = connect_database(self.db_path)
         try:
-            self.assertEqual(migrations.get_user_version(conn), 3)
+            self.assertEqual(migrations.get_user_version(conn), 4)
             self.assertEqual(table_names(conn), EXPECTED_TABLES)
         finally:
             conn.close()
@@ -618,20 +742,21 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(migrations.get_user_version(conn), 0)
             self.assertNotIn("partial_table", table_names(conn))
 
-            self.assertEqual(migrations.migrate_database(conn), 3)
+            self.assertEqual(migrations.migrate_database(conn), 4)
             self.assertEqual(table_names(conn), EXPECTED_TABLES)
         finally:
             conn.close()
 
-    def test_version_1_database_migrates_through_v2_to_v3(self) -> None:
+    def test_version_1_database_migrates_through_v2_v3_to_v4(self) -> None:
         conn = connect_database(self.db_path)
         try:
             migrations.apply_migration(conn, 1, migrations._SCHEMA_MIGRATIONS[1])
             self.assertEqual(migrations.get_user_version(conn), 1)
 
-            self.assertEqual(migrations.migrate_database(conn), 3)
+            self.assertEqual(migrations.migrate_database(conn), 4)
             self.assertIn("analysis_json", table_info(conn, "agent_runs"))
             self.assertIn("generation_jobs", table_names(conn))
+            self.assertIn("conversation_summaries", table_names(conn))
         finally:
             conn.close()
 

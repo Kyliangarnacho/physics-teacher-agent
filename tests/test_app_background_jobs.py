@@ -216,6 +216,13 @@ class AppBackgroundJobTests(unittest.TestCase):
         self.assertTrue(
             any("服务中断" in str(item.value) for item in interrupted_app.warning)
         )
+        self.assertTrue(
+            any(
+                button.key == f"retry_job_{interrupted['generation_job_id']}"
+                for button in interrupted_app.button
+            )
+        )
+        self.assertFalse(interrupted_app.chat_input[0].disabled)
 
         completed_conv, completed = self._enqueue("completed")
         execute_generation_job(

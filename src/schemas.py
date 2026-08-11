@@ -1,7 +1,7 @@
 """初中物理教师 Agent 的结构化分析与路由数据模型。"""
 
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -23,6 +23,7 @@ ShortReasonText = Annotated[
 ]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
+PositiveInt = Annotated[int, Field(ge=1)]
 
 
 class TeachingMode(str, Enum):
@@ -125,6 +126,39 @@ class StepTrace(BaseModel):
         return self
 
 
+class ContextTraceMetadata(BaseModel):
+    """Safe, content-free ContextBundle statistics for one Agent run."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    summary_revision: PositiveInt | None
+    summary_present: StrictBool
+    bridge_turn_count: NonNegativeInt
+    recent_turn_count: NonNegativeInt
+    retrieved_turn_count: NonNegativeInt
+    history_retrieval_used: StrictBool
+    context_estimated_chars: NonNegativeInt
+    budget_limit: PositiveInt
+    budget_exceeded: StrictBool
+    trimmed_components: list[
+        Literal[
+            "retrieved_history",
+            "learning_memory_context",
+            "rolling_summary",
+            "unsafe_history",
+        ]
+    ]
+    analyzer_context_chars: NonNegativeInt
+    tool_context_chars: NonNegativeInt | None
+    final_context_chars: NonNegativeInt | None
+
+    @model_validator(mode="after")
+    def validate_trimmed_components(self) -> "ContextTraceMetadata":
+        if len(self.trimmed_components) != len(set(self.trimmed_components)):
+            raise ValueError("trimmed_components must not contain duplicates.")
+        return self
+
+
 class AgentRunTrace(BaseModel):
     """一次 Agent 运行的结构化汇总记录。"""
 
@@ -143,4 +177,5 @@ class AgentRunTrace(BaseModel):
     teaching_mode: TeachingMode | None
     use_rag: StrictBool
     use_tools: StrictBool
+    context_metadata: ContextTraceMetadata | None = None
     steps: list[StepTrace] = Field(default_factory=list)

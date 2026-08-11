@@ -5,18 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from src.agent import run_teacher_agent as _default_run_agent
-from src.conversation.history import build_recent_history
-from src.conversation.schemas import StoredMessage
+from src.context.adapters import context_bundle_model_inputs
 from src.conversation.state import (
     ResolvedConversationState,
     build_analyzer_state_context,
     build_state_update_after_turn,
-    build_teaching_state_context,
     resolve_conversation_state,
-)
-from src.memory.retrieval import (
-    build_learning_memory_context,
-    retrieve_relevant_memories,
 )
 from src.storage import (
     RepositoryError,
@@ -27,12 +21,19 @@ from src.storage import (
     get_conversation,
     get_conversation_state,
     get_generation_job,
-    get_recent_messages,
 )
 
 
 class ConversationServiceError(Exception):
     """Conversation Service 统一异常，不泄露 SQL、绝对路径或密钥。"""
+
+
+def build_context_bundle(*args, **kwargs):
+    """Lazy proxy that preserves the service-level patch seam."""
+
+    from src.context.manager import build_context_bundle as _build_context_bundle
+
+    return _build_context_bundle(*args, **kwargs)
 
 
 def _require_non_empty_text(value: object, name: str) -> str:
@@ -95,6 +96,12 @@ def _mark_job_failed(job_id: str, error_type: str, db_path) -> None:
         )
     except RepositoryError:
         pass
+
+
+def _memory_context_count(context: str | None) -> int:
+    if not context:
+        return 0
+    return sum(1 for line in context.splitlines() if line.startswith("- ["))
 
 
 def enqueue_conversation_turn(
@@ -190,31 +197,26 @@ def execute_generation_job(
     mode_override = payload["mode_override"]
     rag_policy = payload["rag_policy"]
     confirmed_image_context = payload.get("image_context")
-    max_history_turns = payload["max_history_turns"]
-    max_history_chars = payload["max_history_chars"]
 
     conversation = get_conversation(conversation_id, path=db_path)
     if conversation is None:
         _mark_job_failed(job_id, "conversation_missing", db_path)
         raise ConversationServiceError("会话不存在，无法执行回答任务。")
 
-    recent_messages = get_recent_messages(
-        conversation_id,
-        limit=max(1, max_history_turns * 2 + 1),
-        path=db_path,
-    )
-    recent_messages = [
-        item for item in recent_messages if item["id"] != user_message_id
-    ]
-    stored_messages = [
-        StoredMessage.model_validate(item) for item in recent_messages
-    ]
-    history = build_recent_history(
-        stored_messages,
-        max_turns=max_history_turns,
-        max_chars=max_history_chars,
-    )
     old_state = get_conversation_state(conversation_id, path=db_path)
+    try:
+        context_bundle = build_context_bundle(
+            conversation_id,
+            model_question,
+            previous_state=old_state,
+            path=db_path,
+        )
+    except Exception as exc:
+        _mark_job_failed(job_id, "context_error", db_path)
+        raise ConversationServiceError("本轮上下文构建失败，请稍后重试。") from exc
+    bundle_inputs = context_bundle_model_inputs(context_bundle)
+    history = bundle_inputs["conversation_history"]
+    memory_context = bundle_inputs["learning_memory_context"]
 
     preliminary_resolved = resolve_conversation_state(
         model_question,
@@ -223,16 +225,6 @@ def execute_generation_job(
         mode_override=mode_override,
     )
     teaching_state_context = build_analyzer_state_context(old_state)
-    try:
-        memories = retrieve_relevant_memories(
-            model_question,
-            active_problem_text=preliminary_resolved.active_problem_text,
-            db_path=db_path,
-        )
-        memory_context = build_learning_memory_context(memories)
-    except Exception:
-        memories = []
-        memory_context = None
     effective_model_question = _build_effective_model_question(
         preliminary_resolved,
         model_question,
@@ -262,6 +254,7 @@ def execute_generation_job(
             previous_image_context=(
                 old_state.get("active_image_context") if old_state else None
             ),
+            context_bundle=context_bundle,
         )
     except Exception as exc:
         _mark_job_failed(job_id, "agent_error", db_path)
@@ -327,7 +320,7 @@ def execute_generation_job(
         "resolved_state": resolved,
         "history_turn_count": len(history) // 2,
         "state_context_used": bool(teaching_state_context),
-        "memory_count": len(memories),
+        "memory_count": _memory_context_count(memory_context),
         "memory_context_used": bool(memory_context),
     }
 

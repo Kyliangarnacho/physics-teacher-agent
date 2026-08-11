@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -211,6 +212,59 @@ class GenerationTaskManagerTests(unittest.TestCase):
         failed_job = get_generation_job(failed["generation_job_id"], path=self.db_path)
         self.assertEqual(failed_job["status"], "failed")
         self.assertEqual(failed_job["error_type"], "agent_error")
+
+    def test_unhandled_future_error_terminalizes_and_job_can_retry(self) -> None:
+        item = self._enqueue("Future exception")
+        calls = 0
+
+        def fail_once_then_execute(job_id: str, *, db_path=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                claim_generation_job(job_id, path=db_path)
+                raise RuntimeError("escaped worker error")
+            return execute_generation_job(
+                job_id,
+                db_path=db_path,
+                agent_func=ImmediateAgent(),
+            )
+
+        manager = GenerationTaskManager(
+            db_path=self.db_path,
+            execute_func=fail_once_then_execute,
+        )
+        try:
+            manager.submit(item["generation_job_id"])
+            deadline = time.monotonic() + 2.0
+            while (
+                manager.is_scheduled(item["generation_job_id"])
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+
+            failed = get_generation_job(
+                item["generation_job_id"], path=self.db_path
+            )
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["error_type"], "worker_unhandled_error")
+            self.assertFalse(manager.is_scheduled(item["generation_job_id"]))
+
+            retried = manager.retry(item["generation_job_id"])
+            self.assertTrue(retried["scheduled"])
+        finally:
+            manager.shutdown()
+
+        completed = get_generation_job(
+            item["generation_job_id"], path=self.db_path
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["attempts"], 2)
+        self.assertEqual(
+            [message["role"] for message in list_messages(
+                item["conversation"]["id"], path=self.db_path
+            )],
+            ["user", "assistant"],
+        )
 
     def test_recover_submits_pending_once(self) -> None:
         item = self._enqueue("恢复 pending")
